@@ -8,7 +8,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Dataset, random_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -20,12 +20,48 @@ DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "02691156"
 DEFAULT_VQVAE_CKPT = PROJECT_ROOT / "ckpt" / "vqvae_large_im5_uncond_bsq32.pth"
 
 from fractal3d import (  # noqa: E402
+  FractalBlockBatch,
   Fractal3DGenerator,
   OctreeConfig,
   ShapeOctreeDataset,
   collate_shapes,
 )
 from fractal3d.octgpt_vqvae import encode_bsq_tokens, load_octgpt_vqvae  # noqa: E402
+
+
+def shape_dirs(root: Path, filelist: str | Path | None) -> list[Path]:
+  if filelist is None:
+    return sorted(p for p in root.iterdir() if (p / "pointcloud.npz").exists())
+
+  filelist_path = Path(filelist)
+  dirs: list[Path] = []
+  for line in filelist_path.read_text(encoding="utf-8").splitlines():
+    item = line.strip()
+    if not item:
+      continue
+    path = Path(item)
+    if not path.is_absolute():
+      path = root / item
+    dirs.append(path)
+  return dirs
+
+
+class ShapeUidDataset(Dataset):
+  def __init__(self, root: str | Path, filelist: str | Path | None = None) -> None:
+    self.root = Path(root)
+    self.shape_dirs = shape_dirs(self.root, filelist)
+    if len(self.shape_dirs) == 0:
+      raise RuntimeError(f"No pointcloud.npz files found under {self.root}")
+
+  def __len__(self) -> int:
+    return len(self.shape_dirs)
+
+  def __getitem__(self, index: int) -> dict[str, str]:
+    return {"uid": self.shape_dirs[index].name}
+
+
+def collate_uids(batch: list[dict[str, str]]) -> dict[str, list[str]]:
+  return {"uid": [item["uid"] for item in batch]}
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +77,10 @@ def parse_args() -> argparse.Namespace:
       "--init-split-ckpt",
       default=None,
       help="Optional split checkpoint to initialize the shared model.")
+  parser.add_argument(
+      "--vq-cache-dir",
+      default=None,
+      help="Optional directory of cached VQVAE tokens from cache_vq_tokens.py.")
 
   parser.add_argument("--vqvae-ckpt", default=str(DEFAULT_VQVAE_CKPT))
 
@@ -49,6 +89,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--depth-stop", type=int, default=6)
   parser.add_argument("--points-scale", type=float, default=1.0)
   parser.add_argument("--max-points", type=int, default=120000)
+  parser.add_argument("--sample-seed", type=int, default=0)
 
   parser.add_argument("--dim", type=int, default=256)
   parser.add_argument("--layers", type=int, default=6)
@@ -83,11 +124,42 @@ def set_seed(seed: int) -> None:
 
 
 def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader | None]:
+  if args.vq_cache_dir is not None:
+    train_set = ShapeUidDataset(args.data, filelist=args.filelist)
+    if args.val_filelist:
+      val_set = ShapeUidDataset(args.data, filelist=args.val_filelist)
+    elif args.val_fraction > 0 and len(train_set) > 1:
+      val_len = max(1, int(round(len(train_set) * args.val_fraction)))
+      train_len = len(train_set) - val_len
+      generator = torch.Generator().manual_seed(args.seed)
+      train_set, val_set = random_split(train_set, [train_len, val_len], generator)
+    else:
+      val_set = None
+
+    train_loader = DataLoader(
+      train_set,
+      batch_size=args.batch_size,
+      shuffle=True,
+      num_workers=args.num_workers,
+      collate_fn=collate_uids,
+    )
+    val_loader = None
+    if val_set is not None:
+      val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        collate_fn=collate_uids,
+      )
+    return train_loader, val_loader
+
   config = OctreeConfig(
     depth=args.depth,
     full_depth=args.full_depth,
     points_scale=args.points_scale,
     max_points=args.max_points,
+    sample_seed=args.sample_seed,
   )
   root = Path(args.data)
   train_set = ShapeOctreeDataset(root, config=config, filelist=args.filelist)
@@ -142,12 +214,20 @@ def vq_targets_for_depth(
 
 def vq_loss_for_batch(
   model: Fractal3DGenerator,
-  vqvae: torch.nn.Module,
+  vqvae: torch.nn.Module | None,
   octree,
   expected_code_depth: int,
+  cached_tokens: dict[str, torch.Tensor | int] | None = None,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
-  with torch.no_grad():
-    indices, codes, code_depth = encode_bsq_tokens(vqvae, octree)
+  if cached_tokens is None:
+    if vqvae is None:
+      raise ValueError("vqvae is required when cached_tokens is not provided")
+    with torch.no_grad():
+      indices, codes, code_depth = encode_bsq_tokens(vqvae, octree)
+  else:
+    indices = cached_tokens["indices"].to(octree.device)
+    codes = cached_tokens["codes"].to(octree.device)
+    code_depth = int(cached_tokens["code_depth"])
 
   if code_depth != expected_code_depth:
     raise ValueError(
@@ -166,6 +246,77 @@ def vq_loss_for_batch(
     parent_depth=parent_depth,
     vq_codes=target_codes,
   )
+  loss = F.cross_entropy(
+    logits[valid_bits].reshape(-1, 2),
+    target_indices[valid_bits].reshape(-1),
+  )
+
+  pred = logits.argmax(dim=-1)
+  correct_bits = int(((pred == target_indices) & valid_bits).sum().item())
+  exact_nodes = ((pred == target_indices) | ~valid_bits).all(dim=-1)
+  exact_nodes = exact_nodes & valid
+  node_total = int(valid.sum().item())
+  one_bits = target_indices[valid_bits] == 1
+  pred_one = pred[valid_bits] == 1
+  tp = int((pred_one & one_bits).sum().item())
+  fp = int((pred_one & ~one_bits).sum().item())
+  fn = int((~pred_one & one_bits).sum().item())
+  stats = {
+    "loss_sum": float(loss.detach().item()) * total_bits,
+    "bits": float(total_bits),
+    "bit_correct": float(correct_bits),
+    "nodes": float(node_total),
+    "node_exact": float(exact_nodes.sum().item()),
+    "tp": float(tp),
+    "fp": float(fp),
+    "fn": float(fn),
+  }
+  return loss, stats
+
+
+def cached_block_ready(cached_tokens: dict[str, object]) -> bool:
+  required = {
+    "target_indices",
+    "target_codes",
+    "valid",
+    "block_xyz",
+    "block_depth_idx",
+    "block_role_ids",
+    "block_padding_mask",
+    "block_child_indices",
+  }
+  return required.issubset(cached_tokens.keys())
+
+
+def vq_loss_for_cached_blocks(
+  model: Fractal3DGenerator,
+  cached_tokens: dict[str, object],
+  device: torch.device,
+) -> tuple[torch.Tensor | None, dict[str, float]]:
+  target_indices = cached_tokens["target_indices"].to(device).long()
+  target_codes = cached_tokens["target_codes"].to(device)
+  valid = cached_tokens["valid"].to(device).bool()
+  valid_bits = valid.unsqueeze(-1).expand_as(target_indices)
+  total_bits = int(valid_bits.sum().item())
+  if total_bits == 0:
+    return None, {"bits": 0.0}
+
+  n_parent = target_codes.shape[0]
+  child_inputs = model._teacher_forced_child_embeddings(vq_codes=target_codes)
+  embeddings = torch.zeros(n_parent, 16, model.dim, device=device)
+  embeddings[:, 8:16] = child_inputs
+  blocks = FractalBlockBatch(
+    parent_indices=torch.arange(n_parent, dtype=torch.long, device=device),
+    child_indices=cached_tokens["block_child_indices"].to(device).long(),
+    embeddings=embeddings,
+    xyz=cached_tokens["block_xyz"].to(device),
+    depth_idx=cached_tokens["block_depth_idx"].to(device).long(),
+    role_ids=cached_tokens["block_role_ids"].to(device).long(),
+    padding_mask=cached_tokens["block_padding_mask"].to(device).bool(),
+  )
+  hidden = model.encode_blocks(blocks)
+  logits = model.vq_head(hidden[:, blocks.child_offset:blocks.child_offset + 8])
+  logits = logits.view(logits.shape[0], 8, model.vq_groups, 2)
   loss = F.cross_entropy(
     logits[valid_bits].reshape(-1, 2),
     target_indices[valid_bits].reshape(-1),
@@ -232,14 +383,40 @@ def finalize_stats(total: dict[str, float]) -> dict[str, float]:
   }
 
 
+def batch_uid(batch: dict[str, object]) -> str:
+  uid = batch["uid"]
+  if isinstance(uid, (list, tuple)):
+    return str(uid[0])
+  return str(uid)
+
+
+def load_cached_tokens(
+  cache_dir: Path,
+  uid: str,
+  expected_meta: dict[str, object],
+) -> dict[str, object]:
+  cache_path = cache_dir / f"{uid}.pt"
+  if not cache_path.exists():
+    raise FileNotFoundError(f"Missing VQ cache for {uid}: {cache_path}")
+  cached = torch.load(cache_path, map_location="cpu")
+  for key, expected in expected_meta.items():
+    actual = cached.get(key)
+    if actual != expected:
+      raise ValueError(
+        f"{cache_path} was built with {key}={actual}, expected {expected}.")
+  return cached
+
+
 def run_epoch(
   model: Fractal3DGenerator,
-  vqvae: torch.nn.Module,
+  vqvae: torch.nn.Module | None,
   loader: DataLoader,
   optimizer: torch.optim.Optimizer | None,
   device: torch.device,
   code_depth: int,
   grad_clip: float,
+  vq_cache_dir: Path | None = None,
+  cache_meta: dict[str, object] | None = None,
   writer: SummaryWriter | None = None,
   global_step: int = 0,
   log_every: int = 10,
@@ -248,13 +425,24 @@ def run_epoch(
 ) -> tuple[dict[str, float], int]:
   training = optimizer is not None
   model.train(training)
-  vqvae.eval()
+  if vqvae is not None:
+    vqvae.eval()
   total_stats = empty_stats()
 
   pbar = tqdm(loader, desc=f"{phase} epoch {epoch:04d}", dynamic_ncols=True, leave=False)
   for batch in pbar:
-    octree = batch["octree_gt"].to(device)
-    loss, stats = vq_loss_for_batch(model, vqvae, octree, code_depth)
+    cached_tokens = None
+    if vq_cache_dir is not None:
+      cached_tokens = load_cached_tokens(
+        vq_cache_dir, batch_uid(batch), cache_meta or {})
+      if not cached_block_ready(cached_tokens):
+        raise ValueError(
+          "This VQ cache only contains raw VQVAE tokens. Regenerate it with "
+          "scripts/cache_vq_tokens.py --overwrite to enable fast cached training.")
+      loss, stats = vq_loss_for_cached_blocks(model, cached_tokens, device)
+    else:
+      octree = batch["octree_gt"].to(device)
+      loss, stats = vq_loss_for_batch(model, vqvae, octree, code_depth)
     if loss is None:
       continue
 
@@ -359,6 +547,8 @@ def main() -> None:
 
   if args.depth_stop > args.depth:
     raise ValueError("--depth-stop must be <= --depth")
+  if args.vq_cache_dir is not None and args.batch_size != 1:
+    raise ValueError("--vq-cache-dir currently requires --batch-size 1")
   code_depth = args.depth_stop
   parent_depth = code_depth - 1
   print(
@@ -392,7 +582,19 @@ def main() -> None:
   optimizer = torch.optim.AdamW(
     trainable, lr=args.lr, weight_decay=args.weight_decay)
 
-  vqvae = load_octgpt_vqvae(args.vqvae_ckpt, device)
+  vq_cache_dir = Path(args.vq_cache_dir) if args.vq_cache_dir is not None else None
+  vqvae = None if vq_cache_dir is not None else load_octgpt_vqvae(args.vqvae_ckpt, device)
+  cache_meta = {
+    "depth": args.depth,
+    "full_depth": args.full_depth,
+    "depth_stop": args.depth_stop,
+    "points_scale": args.points_scale,
+    "max_points": args.max_points,
+    "sample_seed": args.sample_seed,
+    "dim": args.dim,
+    "num_vq_embed": args.num_vq_embed,
+    "vq_groups": args.vq_groups,
+  }
 
   start_epoch = 0
   best_val_loss = math.inf
@@ -409,6 +611,8 @@ def main() -> None:
       device=device,
       code_depth=code_depth,
       grad_clip=args.grad_clip,
+      vq_cache_dir=vq_cache_dir,
+      cache_meta=cache_meta,
       writer=writer,
       global_step=epoch * max(len(train_loader), 1),
       log_every=args.log_every,
@@ -428,6 +632,8 @@ def main() -> None:
           device=device,
           code_depth=code_depth,
           grad_clip=args.grad_clip,
+          vq_cache_dir=vq_cache_dir,
+          cache_meta=cache_meta,
           epoch=epoch,
           phase="val",
         )

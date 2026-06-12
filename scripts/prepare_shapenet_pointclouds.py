@@ -8,20 +8,9 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-try:
-  import trimesh
-except ImportError:  # pragma: no cover - exercised only in minimal envs.
-  trimesh = None
-
-try:
-  import mesh2sdf
-except ImportError:  # pragma: no cover - exercised only when SDF is requested.
-  mesh2sdf = None
-
-try:
-  import ocnn
-except ImportError:  # pragma: no cover - exercised only when SDF is requested.
-  ocnn = None
+import trimesh
+import mesh2sdf
+import ocnn
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:

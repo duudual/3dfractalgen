@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from typing import Iterable
 
@@ -19,6 +20,7 @@ class OctreeConfig:
   max_points: int | None = 120000
   distort: bool = False
   noise_std: float = 0.005
+  sample_seed: int = 0
   seq_start_depth: int | None = None
   seq_stop_depth: int | None = None
 
@@ -99,7 +101,10 @@ class ShapeOctreeDataset(Dataset):
 
     max_points = self.config.max_points
     if max_points is not None and points.shape[0] > max_points:
-      choice = np.random.choice(points.shape[0], size=max_points, replace=False)
+      seed_bytes = f"{shape_dir.name}:{self.config.sample_seed}".encode("utf-8")
+      seed = int.from_bytes(hashlib.sha256(seed_bytes).digest()[:8], "little")
+      rng = np.random.default_rng(seed)
+      choice = rng.choice(points.shape[0], size=max_points, replace=False)
       points = points[choice]
       normals = normals[choice]
 
