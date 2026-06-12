@@ -383,7 +383,7 @@ def run_epoch(
   phase: str = "train",
   parallel_child_train: bool = True,
   use_amp: bool = False,
-  scaler: torch.cuda.amp.GradScaler | None = None,
+  scaler: torch.amp.GradScaler | None = None,
 ) -> tuple[dict[str, float], int]:
   training = optimizer is not None
   model.train(training)
@@ -398,7 +398,7 @@ def run_epoch(
     if vq_cache_dir is not None:
       cached_tokens = load_cached_tokens(
         vq_cache_dir, batch_uid(batch), cache_meta or {})
-    with torch.cuda.amp.autocast(enabled=use_amp):
+    with torch.amp.autocast("cuda", enabled=use_amp):
       loss, stats = vq_loss_for_batch(
         model, vqvae, octree, code_depth, cached_tokens, parallel_child_train)
     if loss is None:
@@ -543,7 +543,7 @@ def main() -> None:
   optimizer = torch.optim.AdamW(
     trainable, lr=args.lr, weight_decay=args.weight_decay)
   use_amp = bool(args.amp and device.type == "cuda")
-  scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+  scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
   vq_cache_dir = Path(args.vq_cache_dir) if args.vq_cache_dir is not None else None
   vqvae = None if vq_cache_dir is not None else load_octgpt_vqvae(args.vqvae_ckpt, device)

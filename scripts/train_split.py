@@ -258,7 +258,7 @@ def run_epoch(
   phase: str = "train",
   parallel_child_train: bool = True,
   use_amp: bool = False,
-  scaler: torch.cuda.amp.GradScaler | None = None,
+  scaler: torch.amp.GradScaler | None = None,
 ) -> tuple[dict[str, float], int]:
   training = optimizer is not None
   model.train(training)
@@ -285,7 +285,7 @@ def run_epoch(
         continue
       if parent_depth not in hidden_by_depth:
         continue
-      with torch.cuda.amp.autocast(enabled=use_amp):
+      with torch.amp.autocast("cuda", enabled=use_amp):
         loss, stats, next_hidden = split_loss_for_depth(
           model, octree, parent_depth, hidden_by_depth[parent_depth],
           parallel_child_train=parallel_child_train)
@@ -439,7 +439,7 @@ def main() -> None:
   optimizer = torch.optim.AdamW(
     model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
   use_amp = bool(args.amp and device.type == "cuda")
-  scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+  scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
   start_epoch = 0
   best_val_loss = math.inf
