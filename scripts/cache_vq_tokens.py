@@ -16,11 +16,11 @@ DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "02691156"
 DEFAULT_VQVAE_CKPT = PROJECT_ROOT / "ckpt" / "vqvae_large_im5_uncond_bsq32.pth"
 
 from fractal3d import (  # noqa: E402
-  Fractal3DGenerator,
   OctreeConfig,
   ShapeOctreeDataset,
   collate_shapes,
 )
+from fractal3d.config import parse_args_with_config  # noqa: E402
 from fractal3d.octgpt_vqvae import encode_bsq_tokens, load_octgpt_vqvae  # noqa: E402
 
 
@@ -45,14 +45,14 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--points-scale", type=float, default=1.0)
   parser.add_argument("--max-points", type=int, default=120000)
   parser.add_argument("--sample-seed", type=int, default=0)
-  parser.add_argument("--dim", type=int, default=256)
+  parser.add_argument("--dim", type=int, default=128)
   parser.add_argument("--num-vq-embed", type=int, default=32)
   parser.add_argument("--vq-groups", type=int, default=32)
 
   parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   parser.add_argument("--num-workers", type=int, default=0)
   parser.add_argument("--overwrite", action="store_true")
-  return parser.parse_args()
+  return parse_args_with_config(parser)
 
 
 def main() -> None:
@@ -81,15 +81,6 @@ def main() -> None:
   )
 
   vqvae = load_octgpt_vqvae(args.vqvae_ckpt, device)
-  model = Fractal3DGenerator(
-    dim=args.dim,
-    num_vq_embed=args.num_vq_embed,
-    vq_groups=args.vq_groups,
-    full_depth=args.full_depth,
-    max_depth=args.depth,
-  ).to(device)
-  model.eval()
-
   cached = 0
   skipped = 0
   for batch in tqdm(loader, desc="cache vq tokens", dynamic_ncols=True):
@@ -106,30 +97,11 @@ def main() -> None:
       raise ValueError(
         f"{uid}: VQVAE code depth is {code_depth}, expected {args.depth_stop}.")
 
-    parent_depth = args.depth_stop - 1
-    blocks = model.build_blocks(octree, parent_depth)
-    valid = blocks.child_indices >= 0
-    safe_idx = blocks.child_indices.clamp(min=0)
-    target_indices = indices[safe_idx]
-    target_codes = codes[safe_idx]
-    target_indices = torch.where(
-      valid.unsqueeze(-1), target_indices, torch.zeros_like(target_indices))
-    target_codes = torch.where(
-      valid.unsqueeze(-1), target_codes, torch.zeros_like(target_codes))
-
     tmp_path = path.with_suffix(".tmp")
     torch.save({
       "uid": uid,
       "indices": indices.cpu(),
       "codes": codes.cpu(),
-      "target_indices": target_indices.cpu(),
-      "target_codes": target_codes.cpu(),
-      "valid": valid.cpu(),
-      "block_xyz": blocks.xyz.cpu(),
-      "block_depth_idx": blocks.depth_idx.cpu(),
-      "block_role_ids": blocks.role_ids.cpu(),
-      "block_padding_mask": blocks.padding_mask.cpu(),
-      "block_child_indices": blocks.child_indices.cpu(),
       "code_depth": int(code_depth),
       "depth": args.depth,
       "full_depth": args.full_depth,

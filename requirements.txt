@@ -5,3 +5,4 @@ tqdm
 ocnn
 trimesh
 mesh2sdf
+scikit-image

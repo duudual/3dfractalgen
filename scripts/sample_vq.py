@@ -50,7 +50,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--teacher-forced-vq",
     action="store_true",
-    help="Also evaluate VQ prediction with ground-truth previous child codes.")
+    help="Also save deterministic VQ prediction on the ground-truth octree structure.")
   parser.add_argument("--sdf-points", type=int, default=200000)
   parser.add_argument("--surface-points", type=int, default=20000)
   parser.add_argument("--chunk-size", type=int, default=20000)
@@ -61,9 +61,9 @@ def parse_args() -> argparse.Namespace:
 def model_args_from_checkpoint(checkpoint: dict, args: argparse.Namespace) -> dict:
   saved = checkpoint.get("args", {})
   return {
-    "dim": int(saved.get("dim", 256)),
-    "num_layers": int(saved.get("layers", 6)),
-    "num_heads": int(saved.get("heads", 8)),
+    "dim": int(saved.get("dim", 128)),
+    "num_layers": int(saved.get("layers", 4)),
+    "num_heads": int(saved.get("heads", 4)),
     "num_vq_embed": int(saved.get("num_vq_embed", 32)),
     "vq_groups": int(saved.get("vq_groups", 32)),
     "full_depth": int(saved.get("full_depth", args.full_depth)),
@@ -108,33 +108,28 @@ def predict_structure(
     octree.octree_grow_full(depth, update_neigh=True)
 
   split_by_depth: dict[int, torch.Tensor] = {}
+  parent_depth = full_depth - 1
+  parent_hidden = model.initial_hidden(octree, parent_depth)
   for split_depth in range(full_depth, code_depth):
-    parent_depth = split_depth - 1
-    n_parent = int(octree.nnum[parent_depth])
-    child_inputs = model.mask_token.expand(n_parent, 8, -1).clone()
-    sampled = torch.empty(n_parent, 8, dtype=torch.long, device=device)
-    for child_id in range(8):
-      blocks = model.build_blocks(
-        octree, parent_depth, child_input_embeddings=child_inputs)
-      hidden = model.encode_blocks(blocks)
-      logits = model.split_head(hidden[:, blocks.child_offset + child_id])
-      if sample_tokens:
-        probs = F.softmax(logits / temperature, dim=-1)
-        token = torch.multinomial(probs, num_samples=1).squeeze(1)
-      else:
-        token = logits.argmax(dim=-1)
-      sampled[:, child_id] = token
-      child_inputs[:, child_id] = model.split_emb(token)
-
-    blocks = model.build_blocks(octree, parent_depth)
-    valid = blocks.child_indices >= 0
-    safe_idx = blocks.child_indices.clamp(min=0)
+    logits, child_hidden, child_indices = model.forward_split(
+      octree, parent_depth, parent_hidden)
+    if sample_tokens:
+      probs = F.softmax(logits / temperature, dim=-1)
+      sampled = torch.multinomial(probs.reshape(-1, 2), num_samples=1)
+      sampled = sampled.view(logits.shape[0], 8)
+    else:
+      sampled = logits.argmax(dim=-1)
+    valid = child_indices >= 0
+    safe_idx = child_indices.clamp(min=0)
     split = torch.zeros(
       int(octree.nnum[split_depth]), dtype=torch.int32, device=device)
     split[safe_idx[valid]] = sampled[valid].int()
     split_by_depth[split_depth] = split.detach().cpu()
     octree.octree_split(split, split_depth)
     octree.octree_grow(split_depth + 1, update_neigh=True)
+    parent_hidden = model.scatter_child_hidden(
+      child_hidden, child_indices, int(octree.nnum[split_depth]))
+    parent_depth = split_depth
   return octree, split_by_depth
 
 
@@ -151,28 +146,21 @@ def predict_depth_vq(
   pred_indices = torch.zeros(
     n_code, model.vq_groups, dtype=torch.long, device=octree.device)
 
-  n_parent = int(octree.nnum[parent_depth])
-  child_inputs = model.mask_token.expand(n_parent, 8, -1).clone()
-  child_indices = torch.empty(
-    n_parent, 8, model.vq_groups, dtype=torch.long, device=octree.device)
-  for child_id in range(8):
-    blocks = model.build_blocks(octree, parent_depth, child_input_embeddings=child_inputs)
-    hidden = model.encode_blocks(blocks)
-    logits = model.vq_head(hidden[:, blocks.child_offset + child_id])
-    logits = logits.view(n_parent, model.vq_groups, 2)
-    if sample_tokens:
-      probs = F.softmax(logits / temperature, dim=-1)
-      token = torch.multinomial(probs.reshape(-1, 2), num_samples=1)
-      token = token.view(n_parent, model.vq_groups)
-    else:
-      token = logits.argmax(dim=-1)
-    zq = vqvae.quantizer.extract_code(token)
-    child_indices[:, child_id] = token
-    child_inputs[:, child_id] = model.vq_proj(zq)
+  parent_hidden = model.initial_hidden(octree, model.full_depth - 1)
+  for depth in range(model.full_depth - 1, parent_depth):
+    _, child_hidden, child_idx = model.forward_split(octree, depth, parent_hidden)
+    parent_hidden = model.scatter_child_hidden(
+      child_hidden, child_idx, int(octree.nnum[depth + 1]))
 
-  blocks = model.build_blocks(octree, parent_depth)
-  valid = blocks.child_indices >= 0
-  safe_idx = blocks.child_indices.clamp(min=0)
+  logits, _, child_idx = model.forward_vq(octree, parent_depth, parent_hidden)
+  if sample_tokens:
+    probs = F.softmax(logits / temperature, dim=-1)
+    token = torch.multinomial(probs.reshape(-1, 2), num_samples=1)
+    child_indices = token.view(logits.shape[0], 8, model.vq_groups)
+  else:
+    child_indices = logits.argmax(dim=-1)
+  valid = child_idx >= 0
+  safe_idx = child_idx.clamp(min=0)
   pred_indices[safe_idx[valid]] = child_indices[valid]
   pred_codes = vqvae.quantizer.extract_code(pred_indices)
   return pred_indices, pred_codes, valid
@@ -187,19 +175,16 @@ def predict_depth_vq_teacher_forced(
   gt_codes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   parent_depth = code_depth - 1
-  blocks = model.build_blocks(octree, parent_depth)
-  valid = blocks.child_indices >= 0
-  safe_idx = blocks.child_indices.clamp(min=0)
-  target_codes = gt_codes[safe_idx]
-  target_codes = torch.where(
-    valid.unsqueeze(-1), target_codes, torch.zeros_like(target_codes))
-  logits, blocks = model.forward_vq(
-    octree=octree,
-    parent_depth=parent_depth,
-    vq_codes=target_codes,
-  )
+  parent_hidden = model.initial_hidden(octree, model.full_depth - 1)
+  for depth in range(model.full_depth - 1, parent_depth):
+    _, child_hidden, child_idx = model.forward_split(octree, depth, parent_hidden)
+    parent_hidden = model.scatter_child_hidden(
+      child_hidden, child_idx, int(octree.nnum[depth + 1]))
+  logits, _, child_idx = model.forward_vq(octree, parent_depth, parent_hidden)
   pred_child = logits.argmax(dim=-1)
   pred_indices = torch.zeros_like(gt_indices)
+  valid = child_idx >= 0
+  safe_idx = child_idx.clamp(min=0)
   pred_indices[safe_idx[valid]] = pred_child[valid]
   pred_codes = vqvae.quantizer.extract_code(pred_indices)
   return pred_indices, pred_codes, valid

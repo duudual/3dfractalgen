@@ -24,6 +24,7 @@ from fractal3d import (  # noqa: E402
   ShapeOctreeDataset,
   collate_shapes,
 )
+from fractal3d.config import parse_args_with_config  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,9 +53,9 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--points-scale", type=float, default=1.0)
   parser.add_argument("--max-points", type=int, default=120000)
 
-  parser.add_argument("--dim", type=int, default=256)
-  parser.add_argument("--layers", type=int, default=6)
-  parser.add_argument("--heads", type=int, default=8)
+  parser.add_argument("--dim", type=int, default=128)
+  parser.add_argument("--layers", type=int, default=4)
+  parser.add_argument("--heads", type=int, default=4)
   parser.add_argument("--dropout", type=float, default=0.1)
 
   parser.add_argument("--epochs", type=int, default=100)
@@ -67,7 +68,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   parser.add_argument("--log-every", type=int, default=10)
   parser.add_argument("--val-every", type=int, default=1)
-  return parser.parse_args()
+  return parse_args_with_config(parser)
 
 
 def set_seed(seed: int) -> None:
@@ -135,16 +136,17 @@ def split_loss_for_depth(
   model: Fractal3DGenerator,
   octree,
   parent_depth: int,
-) -> tuple[torch.Tensor | None, dict[str, int]]:
+  parent_hidden: torch.Tensor,
+) -> tuple[torch.Tensor | None, dict[str, int], torch.Tensor | None]:
   targets, valid = child_split_targets(model, octree, parent_depth)
   total = int(valid.sum().item())
   if total == 0:
-    return None, {"tokens": 0}
+    return None, {"tokens": 0}, None
 
-  logits, _ = model.forward_split(
+  logits, child_hidden, child_indices = model.forward_split(
     octree=octree,
     parent_depth=parent_depth,
-    split_targets=targets,
+    parent_hidden=parent_hidden,
   )
   loss_per_token = F.cross_entropy(
     logits.reshape(-1, 2),
@@ -172,7 +174,9 @@ def split_loss_for_depth(
     "fp": int((pred_split & leaf_mask).sum().item()),
     "fn": int(((~pred_split) & split_mask).sum().item()),
   }
-  return loss, stats
+  next_hidden = model.scatter_child_hidden(
+    child_hidden, child_indices, int(octree.nnum[parent_depth + 1]))
+  return loss, stats, next_hidden
 
 
 def empty_stats() -> dict[str, float]:
@@ -257,13 +261,21 @@ def run_epoch(
     octree = batch["octree_gt"].to(device)
     losses: list[torch.Tensor] = []
     batch_stats = empty_stats()
+    hidden_by_depth: dict[int, torch.Tensor] = {
+      depth_low: model.initial_hidden(octree, depth_low)
+    }
 
     for parent_depth in range(depth_low, depth_high + 1):
       if parent_depth + 1 > octree.depth:
         continue
-      loss, stats = split_loss_for_depth(model, octree, parent_depth)
+      if parent_depth not in hidden_by_depth:
+        continue
+      loss, stats, next_hidden = split_loss_for_depth(
+        model, octree, parent_depth, hidden_by_depth[parent_depth])
       if loss is None:
         continue
+      if next_hidden is not None:
+        hidden_by_depth[parent_depth + 1] = next_hidden
       loss_value = float(loss.detach().item())
       losses.append(loss * stats["tokens"])
       add_stats(batch_stats, loss_value, stats)

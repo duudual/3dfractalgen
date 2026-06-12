@@ -9,6 +9,38 @@
 ## 核心设计
 采用分形思想，父伯子：现在已经求出第i层节点，要预测第i层节点的分裂情况，使用AR，传入的数据是该i层节点的同属于一个i-1层父节点的兄弟的token和该节点的token，以及要预测8个子节点的token,组成一个seq，经过transformer，使用AR得到每个属于i+1层的子节点的token，然后经过一个预测head预测每个节点的split or no split. 最终生成具体的点的内容复用OctGPT的 VQ-VAE 模块.
 这种父伯子的建模方式，是分型思想的小块内可独自预测，与OctGPT的一次预测第i层所有的不同.这种设计本身避免了OctGPT可能出现第i层节点数过多时，由于父节点顺序排放在最前面，导致的没法看到父节点，而只能通过dilated_window等方式间接看到的缺陷,因为每次都是一个小局部，局部attention很适用.
+
+接下来我要进行这样的修改：1.要使用parent hidden state,uncle的找法是找当前父节点的8个子节点，这些节点不论最终是否split，都会有hidden state,这些拿来。child预测
+  的内容也是hidden state,然后用split head预测split情况; 2. 删除split embedding,因为child会用hidden state; 3.删除mask token,因为完全使用AR; 4.VQ也是对hiddenstate
+  通过vq_head预测; 5.role embedding只区分parent和uncle，因为预测child时都是用hidden state,不需要child embedding; 6.absolute 3D position embedding我要进行修改改
+  成局部位置坐标.octgpt这样做是因为它局限在单个小物体的单独空间中，前面说到过uncle要改成固定window在z-order序列上找节点了，这里的位置编码就修改成因为固定有八个
+  节点嘛，同时这八个的排列顺序要依据位置固定，可以是看z-order的前后顺序，然后position embedding改成用 child_id 的 3-bit 局部坐标编码
+  每个 child id 可以拆成 3 个 bit：
+  octant_pos = sx * emb_x + sy * emb_y + sz * emb_z. emb_x,y,z是可学习的embedding.这个是要和role embedding一起加入到parent/uncle hiddenstate的
+
+  - 模型结构：
+      - 删除 split_emb、mask_token、vq_proj 作为 child AR 输入的用途。
+      - role_emb 改成 2 类：parent 和 uncle；child query 不使用 role embedding。
+      - 新增 learnable seed_token 初始化 full_depth 节点 hidden。
+      - 新增 LocalOctantPosEmb：三个可学习向量 emb_x/emb_y/emb_z，按 OCNN child 顺序计算：
+          - x = id & 1
+          - y = (id >> 1) & 1
+          - z = (id >> 2) & 1
+          - octant_pos = sx * emb_x + sy * emb_y + sz * emb_z
+
+      - 删除/弃用 AbsPosEmb 在该模型中的使用。
+
+  - AR hidden 生成：
+      - 对每个 parent，context 是它所在 sibling group 的 8 个同层节点 hidden。
+      - 当前 parent 加 parent role embedding，其他 7 个 sibling 加 uncle role embedding。
+      - sibling group 不按缺失处理：只对真实存在于当前 depth 的节点建组；由 split 父节点产生的 8 个 child 都拥有 hidden state，即使它们最终不 split。
+      - 预测 child k 时输入：
+          - 8 个 parent/sibling context hidden
+          - 已生成的 0..k-1 child hidden
+          - 当前 child 的 query：octant_pos(k)
+
+      - Transformer 输出当前 query 的 hidden，作为 child k 的 hidden state。
+      - 8 个 child hidden 全部生成后 scatter 到下一层 hidden buffer；只有真实/预测存在的 child indices 参与下一层结构。
 ## ShapeNet octree preprocessing
 
 The raw ShapeNet category directory is expected to contain samples like:

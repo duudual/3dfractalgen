@@ -20,12 +20,12 @@ DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "02691156"
 DEFAULT_VQVAE_CKPT = PROJECT_ROOT / "ckpt" / "vqvae_large_im5_uncond_bsq32.pth"
 
 from fractal3d import (  # noqa: E402
-  FractalBlockBatch,
   Fractal3DGenerator,
   OctreeConfig,
   ShapeOctreeDataset,
   collate_shapes,
 )
+from fractal3d.config import parse_args_with_config  # noqa: E402
 from fractal3d.octgpt_vqvae import encode_bsq_tokens, load_octgpt_vqvae  # noqa: E402
 
 
@@ -91,9 +91,9 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--max-points", type=int, default=120000)
   parser.add_argument("--sample-seed", type=int, default=0)
 
-  parser.add_argument("--dim", type=int, default=256)
-  parser.add_argument("--layers", type=int, default=6)
-  parser.add_argument("--heads", type=int, default=8)
+  parser.add_argument("--dim", type=int, default=128)
+  parser.add_argument("--layers", type=int, default=4)
+  parser.add_argument("--heads", type=int, default=4)
   parser.add_argument("--dropout", type=float, default=0.1)
   parser.add_argument("--num-vq-embed", type=int, default=32)
   parser.add_argument("--vq-groups", type=int, default=32)
@@ -113,7 +113,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   parser.add_argument("--log-every", type=int, default=10)
   parser.add_argument("--val-every", type=int, default=1)
-  return parser.parse_args()
+  return parse_args_with_config(parser)
 
 
 def set_seed(seed: int) -> None:
@@ -200,9 +200,9 @@ def vq_targets_for_depth(
   codes: torch.Tensor,
   parent_depth: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  blocks = model.build_blocks(octree, parent_depth)
-  valid = blocks.child_indices >= 0
-  safe_idx = blocks.child_indices.clamp(min=0)
+  child_indices = model._child_indices(octree, parent_depth)
+  valid = child_indices >= 0
+  safe_idx = child_indices.clamp(min=0)
   target_indices = indices[safe_idx]
   target_codes = codes[safe_idx]
   target_indices = torch.where(
@@ -210,6 +210,20 @@ def vq_targets_for_depth(
   target_codes = torch.where(
     valid.unsqueeze(-1), target_codes, torch.zeros_like(target_codes))
   return target_indices.long(), target_codes, valid
+
+
+def hidden_at_depth(
+  model: Fractal3DGenerator,
+  octree,
+  start_depth: int,
+  target_depth: int,
+) -> torch.Tensor:
+  hidden = model.initial_hidden(octree, start_depth)
+  for parent_depth in range(start_depth, target_depth):
+    _, child_hidden, child_indices = model.forward_split(octree, parent_depth, hidden)
+    hidden = model.scatter_child_hidden(
+      child_hidden, child_indices, int(octree.nnum[parent_depth + 1]))
+  return hidden
 
 
 def vq_loss_for_batch(
@@ -234,89 +248,20 @@ def vq_loss_for_batch(
       f"VQVAE code depth is {code_depth}, expected {expected_code_depth}.")
 
   parent_depth = code_depth - 1
-  target_indices, target_codes, valid = vq_targets_for_depth(
+  target_indices, _, valid = vq_targets_for_depth(
     model, octree, indices, codes, parent_depth)
   valid_bits = valid.unsqueeze(-1).expand_as(target_indices)
   total_bits = int(valid_bits.sum().item())
   if total_bits == 0:
     return None, {"bits": 0.0}
 
-  logits, _ = model.forward_vq(
+  parent_hidden = hidden_at_depth(
+    model, octree, model.full_depth - 1, parent_depth)
+  logits, _, _ = model.forward_vq(
     octree=octree,
     parent_depth=parent_depth,
-    vq_codes=target_codes,
+    parent_hidden=parent_hidden,
   )
-  loss = F.cross_entropy(
-    logits[valid_bits].reshape(-1, 2),
-    target_indices[valid_bits].reshape(-1),
-  )
-
-  pred = logits.argmax(dim=-1)
-  correct_bits = int(((pred == target_indices) & valid_bits).sum().item())
-  exact_nodes = ((pred == target_indices) | ~valid_bits).all(dim=-1)
-  exact_nodes = exact_nodes & valid
-  node_total = int(valid.sum().item())
-  one_bits = target_indices[valid_bits] == 1
-  pred_one = pred[valid_bits] == 1
-  tp = int((pred_one & one_bits).sum().item())
-  fp = int((pred_one & ~one_bits).sum().item())
-  fn = int((~pred_one & one_bits).sum().item())
-  stats = {
-    "loss_sum": float(loss.detach().item()) * total_bits,
-    "bits": float(total_bits),
-    "bit_correct": float(correct_bits),
-    "nodes": float(node_total),
-    "node_exact": float(exact_nodes.sum().item()),
-    "tp": float(tp),
-    "fp": float(fp),
-    "fn": float(fn),
-  }
-  return loss, stats
-
-
-def cached_block_ready(cached_tokens: dict[str, object]) -> bool:
-  required = {
-    "target_indices",
-    "target_codes",
-    "valid",
-    "block_xyz",
-    "block_depth_idx",
-    "block_role_ids",
-    "block_padding_mask",
-    "block_child_indices",
-  }
-  return required.issubset(cached_tokens.keys())
-
-
-def vq_loss_for_cached_blocks(
-  model: Fractal3DGenerator,
-  cached_tokens: dict[str, object],
-  device: torch.device,
-) -> tuple[torch.Tensor | None, dict[str, float]]:
-  target_indices = cached_tokens["target_indices"].to(device).long()
-  target_codes = cached_tokens["target_codes"].to(device)
-  valid = cached_tokens["valid"].to(device).bool()
-  valid_bits = valid.unsqueeze(-1).expand_as(target_indices)
-  total_bits = int(valid_bits.sum().item())
-  if total_bits == 0:
-    return None, {"bits": 0.0}
-
-  n_parent = target_codes.shape[0]
-  child_inputs = model._teacher_forced_child_embeddings(vq_codes=target_codes)
-  embeddings = torch.zeros(n_parent, 16, model.dim, device=device)
-  embeddings[:, 8:16] = child_inputs
-  blocks = FractalBlockBatch(
-    parent_indices=torch.arange(n_parent, dtype=torch.long, device=device),
-    child_indices=cached_tokens["block_child_indices"].to(device).long(),
-    embeddings=embeddings,
-    xyz=cached_tokens["block_xyz"].to(device),
-    depth_idx=cached_tokens["block_depth_idx"].to(device).long(),
-    role_ids=cached_tokens["block_role_ids"].to(device).long(),
-    padding_mask=cached_tokens["block_padding_mask"].to(device).bool(),
-  )
-  hidden = model.encode_blocks(blocks)
-  logits = model.vq_head(hidden[:, blocks.child_offset:blocks.child_offset + 8])
-  logits = logits.view(logits.shape[0], 8, model.vq_groups, 2)
   loss = F.cross_entropy(
     logits[valid_bits].reshape(-1, 2),
     target_indices[valid_bits].reshape(-1),
@@ -431,18 +376,12 @@ def run_epoch(
 
   pbar = tqdm(loader, desc=f"{phase} epoch {epoch:04d}", dynamic_ncols=True, leave=False)
   for batch in pbar:
+    octree = batch["octree_gt"].to(device)
     cached_tokens = None
     if vq_cache_dir is not None:
       cached_tokens = load_cached_tokens(
         vq_cache_dir, batch_uid(batch), cache_meta or {})
-      if not cached_block_ready(cached_tokens):
-        raise ValueError(
-          "This VQ cache only contains raw VQVAE tokens. Regenerate it with "
-          "scripts/cache_vq_tokens.py --overwrite to enable fast cached training.")
-      loss, stats = vq_loss_for_cached_blocks(model, cached_tokens, device)
-    else:
-      octree = batch["octree_gt"].to(device)
-      loss, stats = vq_loss_for_batch(model, vqvae, octree, code_depth)
+    loss, stats = vq_loss_for_batch(model, vqvae, octree, code_depth, cached_tokens)
     if loss is None:
       continue
 
