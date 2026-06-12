@@ -57,6 +57,16 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--layers", type=int, default=4)
   parser.add_argument("--heads", type=int, default=4)
   parser.add_argument("--dropout", type=float, default=0.1)
+  parser.add_argument(
+    "--parallel-child-train",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Predict all 8 child hidden states in one causal transformer pass.")
+  parser.add_argument(
+    "--amp",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Use CUDA automatic mixed precision during training/evaluation.")
 
   parser.add_argument("--epochs", type=int, default=100)
   parser.add_argument("--batch-size", type=int, default=1)
@@ -137,6 +147,7 @@ def split_loss_for_depth(
   octree,
   parent_depth: int,
   parent_hidden: torch.Tensor,
+  parallel_child_train: bool,
 ) -> tuple[torch.Tensor | None, dict[str, int], torch.Tensor | None]:
   targets, valid = child_split_targets(model, octree, parent_depth)
   total = int(valid.sum().item())
@@ -147,6 +158,7 @@ def split_loss_for_depth(
     octree=octree,
     parent_depth=parent_depth,
     parent_hidden=parent_hidden,
+    parallel=parallel_child_train,
   )
   loss_per_token = F.cross_entropy(
     logits.reshape(-1, 2),
@@ -244,6 +256,9 @@ def run_epoch(
   log_every: int = 10,
   epoch: int = 0,
   phase: str = "train",
+  parallel_child_train: bool = True,
+  use_amp: bool = False,
+  scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> tuple[dict[str, float], int]:
   training = optimizer is not None
   model.train(training)
@@ -270,8 +285,10 @@ def run_epoch(
         continue
       if parent_depth not in hidden_by_depth:
         continue
-      loss, stats, next_hidden = split_loss_for_depth(
-        model, octree, parent_depth, hidden_by_depth[parent_depth])
+      with torch.cuda.amp.autocast(enabled=use_amp):
+        loss, stats, next_hidden = split_loss_for_depth(
+          model, octree, parent_depth, hidden_by_depth[parent_depth],
+          parallel_child_train=parallel_child_train)
       if loss is None:
         continue
       if next_hidden is not None:
@@ -290,11 +307,14 @@ def run_epoch(
 
     loss = torch.stack(losses).sum() / batch_stats["tokens"]
     if training:
+      assert scaler is not None
       optimizer.zero_grad(set_to_none=True)
-      loss.backward()
+      scaler.scale(loss).backward()
       if grad_clip > 0:
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-      optimizer.step()
+      scaler.step(optimizer)
+      scaler.update()
       global_step += 1
 
       if writer is not None and global_step % log_every == 0:
@@ -418,6 +438,8 @@ def main() -> None:
   ).to(device)
   optimizer = torch.optim.AdamW(
     model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+  use_amp = bool(args.amp and device.type == "cuda")
+  scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
   start_epoch = 0
   best_val_loss = math.inf
@@ -439,6 +461,9 @@ def main() -> None:
       log_every=args.log_every,
       epoch=epoch,
       phase="train",
+      parallel_child_train=args.parallel_child_train,
+      use_amp=use_amp,
+      scaler=scaler,
     )
     write_epoch_metrics(writer, "train", train_metrics, epoch)
 
@@ -455,6 +480,8 @@ def main() -> None:
           grad_clip=args.grad_clip,
           epoch=epoch,
           phase="val",
+          parallel_child_train=args.parallel_child_train,
+          use_amp=use_amp,
         )
       write_epoch_metrics(writer, "val", val_metrics, epoch)
       monitor_loss = val_metrics["loss"]

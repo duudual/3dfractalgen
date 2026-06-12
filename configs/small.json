@@ -10,6 +10,8 @@
   "layers": 4,
   "heads": 4,
   "dropout": 0.1,
+  "parallel_child_train": true,
+  "amp": true,
   "num_vq_embed": 32,
   "vq_groups": 32,
   "epochs": 100,

@@ -95,6 +95,16 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--layers", type=int, default=4)
   parser.add_argument("--heads", type=int, default=4)
   parser.add_argument("--dropout", type=float, default=0.1)
+  parser.add_argument(
+      "--parallel-child-train",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help="Predict all 8 child hidden states in one causal transformer pass.")
+  parser.add_argument(
+      "--amp",
+      action=argparse.BooleanOptionalAction,
+      default=True,
+      help="Use CUDA automatic mixed precision during training/evaluation.")
   parser.add_argument("--num-vq-embed", type=int, default=32)
   parser.add_argument("--vq-groups", type=int, default=32)
   parser.add_argument(
@@ -217,10 +227,12 @@ def hidden_at_depth(
   octree,
   start_depth: int,
   target_depth: int,
+  parallel_child_train: bool,
 ) -> torch.Tensor:
   hidden = model.initial_hidden(octree, start_depth)
   for parent_depth in range(start_depth, target_depth):
-    _, child_hidden, child_indices = model.forward_split(octree, parent_depth, hidden)
+    _, child_hidden, child_indices = model.forward_split(
+      octree, parent_depth, hidden, parallel=parallel_child_train)
     hidden = model.scatter_child_hidden(
       child_hidden, child_indices, int(octree.nnum[parent_depth + 1]))
   return hidden
@@ -232,6 +244,7 @@ def vq_loss_for_batch(
   octree,
   expected_code_depth: int,
   cached_tokens: dict[str, torch.Tensor | int] | None = None,
+  parallel_child_train: bool = True,
 ) -> tuple[torch.Tensor | None, dict[str, float]]:
   if cached_tokens is None:
     if vqvae is None:
@@ -256,11 +269,12 @@ def vq_loss_for_batch(
     return None, {"bits": 0.0}
 
   parent_hidden = hidden_at_depth(
-    model, octree, model.full_depth - 1, parent_depth)
+    model, octree, model.full_depth - 1, parent_depth, parallel_child_train)
   logits, _, _ = model.forward_vq(
     octree=octree,
     parent_depth=parent_depth,
     parent_hidden=parent_hidden,
+    parallel=parallel_child_train,
   )
   loss = F.cross_entropy(
     logits[valid_bits].reshape(-1, 2),
@@ -367,6 +381,9 @@ def run_epoch(
   log_every: int = 10,
   epoch: int = 0,
   phase: str = "train",
+  parallel_child_train: bool = True,
+  use_amp: bool = False,
+  scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> tuple[dict[str, float], int]:
   training = optimizer is not None
   model.train(training)
@@ -381,17 +398,22 @@ def run_epoch(
     if vq_cache_dir is not None:
       cached_tokens = load_cached_tokens(
         vq_cache_dir, batch_uid(batch), cache_meta or {})
-    loss, stats = vq_loss_for_batch(model, vqvae, octree, code_depth, cached_tokens)
+    with torch.cuda.amp.autocast(enabled=use_amp):
+      loss, stats = vq_loss_for_batch(
+        model, vqvae, octree, code_depth, cached_tokens, parallel_child_train)
     if loss is None:
       continue
 
     if training:
+      assert scaler is not None
       optimizer.zero_grad(set_to_none=True)
-      loss.backward()
+      scaler.scale(loss).backward()
       if grad_clip > 0:
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
           [p for p in model.parameters() if p.requires_grad], grad_clip)
-      optimizer.step()
+      scaler.step(optimizer)
+      scaler.update()
       global_step += 1
 
       if writer is not None and global_step % log_every == 0:
@@ -520,6 +542,8 @@ def main() -> None:
   trainable = [p for p in model.parameters() if p.requires_grad]
   optimizer = torch.optim.AdamW(
     trainable, lr=args.lr, weight_decay=args.weight_decay)
+  use_amp = bool(args.amp and device.type == "cuda")
+  scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
   vq_cache_dir = Path(args.vq_cache_dir) if args.vq_cache_dir is not None else None
   vqvae = None if vq_cache_dir is not None else load_octgpt_vqvae(args.vqvae_ckpt, device)
@@ -557,6 +581,9 @@ def main() -> None:
       log_every=args.log_every,
       epoch=epoch,
       phase="train",
+      parallel_child_train=args.parallel_child_train,
+      use_amp=use_amp,
+      scaler=scaler,
     )
     write_epoch_metrics(writer, "train", train_metrics, epoch)
 
@@ -575,6 +602,8 @@ def main() -> None:
           cache_meta=cache_meta,
           epoch=epoch,
           phase="val",
+          parallel_child_train=args.parallel_child_train,
+          use_amp=use_amp,
         )
       write_epoch_metrics(writer, "val", val_metrics, epoch)
       monitor_loss = val_metrics["loss"]

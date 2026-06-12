@@ -59,8 +59,13 @@ class ChildARTransformer(nn.Module):
     self.layers = nn.TransformerEncoder(layer, num_layers=num_layers)
     self.norm = nn.LayerNorm(dim)
 
-  def forward(self, x: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
-    x = self.layers(x, src_key_padding_mask=padding_mask)
+  def forward(
+    self,
+    x: torch.Tensor,
+    padding_mask: torch.Tensor,
+    attn_mask: torch.Tensor | None = None,
+  ) -> torch.Tensor:
+    x = self.layers(x, mask=attn_mask, src_key_padding_mask=padding_mask)
     return self.norm(x)
 
 
@@ -92,7 +97,26 @@ class Fractal3DGenerator(nn.Module):
       dim=dim, num_layers=num_layers, num_heads=num_heads, dropout=dropout)
     self.split_head = nn.Linear(dim, 2)
     self.vq_head = nn.Linear(dim, self.vq_groups * 2)
+    self.register_buffer(
+      "parallel_child_attn_mask",
+      self._build_parallel_child_attn_mask(),
+      persistent=False,
+    )
     self._init_weights()
+
+  @staticmethod
+  def _build_parallel_child_attn_mask() -> torch.Tensor:
+    seq_len = 16
+    child_offset = 8
+    mask = torch.zeros(seq_len, seq_len, dtype=torch.bool)
+    mask[:child_offset, child_offset:] = True
+    for query in range(child_offset, seq_len):
+      child_query = query - child_offset
+      for key in range(child_offset, seq_len):
+        child_key = key - child_offset
+        if child_key > child_query:
+          mask[query, key] = True
+    return mask
 
   def _init_weights(self) -> None:
     nn.init.normal_(self.seed_token, std=0.02)
@@ -182,7 +206,11 @@ class Fractal3DGenerator(nn.Module):
     octree,
     parent_depth: int,
     parent_hidden: torch.Tensor,
+    parallel: bool = False,
   ) -> tuple[torch.Tensor, torch.Tensor]:
+    if parallel:
+      return self.forward_children_parallel(octree, parent_depth, parent_hidden)
+
     context, context_padding = self._context_tokens(octree, parent_depth, parent_hidden)
     n_parent = context.shape[0]
     child_outputs: list[torch.Tensor] = []
@@ -209,13 +237,34 @@ class Fractal3DGenerator(nn.Module):
     child_hidden = torch.stack(child_outputs, dim=1)
     return child_hidden, self._child_indices(octree, parent_depth)
 
+  def forward_children_parallel(
+    self,
+    octree,
+    parent_depth: int,
+    parent_hidden: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    context, context_padding = self._context_tokens(octree, parent_depth, parent_hidden)
+    n_parent = context.shape[0]
+    child_id = torch.arange(8, dtype=torch.long, device=octree.device)
+    queries = self.local_pos_emb(child_id).unsqueeze(0).expand(n_parent, -1, -1)
+    seq = torch.cat([context, queries], dim=1)
+    padding = torch.cat([
+      context_padding,
+      torch.zeros(n_parent, 8, dtype=torch.bool, device=octree.device),
+    ], dim=1)
+    attn_mask = self.parallel_child_attn_mask.to(device=octree.device)
+    hidden = self.transformer(seq, padding, attn_mask=attn_mask)
+    return hidden[:, 8:16], self._child_indices(octree, parent_depth)
+
   def forward_split(
     self,
     octree,
     parent_depth: int,
     parent_hidden: torch.Tensor,
+    parallel: bool = False,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    child_hidden, child_indices = self.forward_children(octree, parent_depth, parent_hidden)
+    child_hidden, child_indices = self.forward_children(
+      octree, parent_depth, parent_hidden, parallel=parallel)
     logits = self.split_head(child_hidden)
     return logits, child_hidden, child_indices
 
@@ -224,8 +273,10 @@ class Fractal3DGenerator(nn.Module):
     octree,
     parent_depth: int,
     parent_hidden: torch.Tensor,
+    parallel: bool = False,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    child_hidden, child_indices = self.forward_children(octree, parent_depth, parent_hidden)
+    child_hidden, child_indices = self.forward_children(
+      octree, parent_depth, parent_hidden, parallel=parallel)
     logits = self.vq_head(child_hidden)
     logits = logits.view(logits.shape[0], 8, self.vq_groups, 2)
     return logits, child_hidden, child_indices
