@@ -13,13 +13,11 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT = PROJECT_ROOT.parent
 if str(PROJECT_ROOT) not in sys.path:
   sys.path.insert(0, str(PROJECT_ROOT))
 
 DEFAULT_DATA_DIR = PROJECT_ROOT / "data" / "02691156"
 DEFAULT_VQVAE_CKPT = PROJECT_ROOT / "ckpt" / "vqvae_large_im5_uncond_bsq32.pth"
-DEFAULT_OCTGPT_ROOT = REPO_ROOT / "octgpt"
 
 from fractal3d import (  # noqa: E402
   Fractal3DGenerator,
@@ -44,7 +42,6 @@ def parse_args() -> argparse.Namespace:
       default=None,
       help="Optional split checkpoint to initialize the shared model.")
 
-  parser.add_argument("--octgpt-root", default=str(DEFAULT_OCTGPT_ROOT))
   parser.add_argument("--vqvae-ckpt", default=str(DEFAULT_VQVAE_CKPT))
 
   parser.add_argument("--depth", type=int, default=8)
@@ -395,7 +392,7 @@ def main() -> None:
   optimizer = torch.optim.AdamW(
     trainable, lr=args.lr, weight_decay=args.weight_decay)
 
-  vqvae = load_octgpt_vqvae(args.octgpt_root, args.vqvae_ckpt, device)
+  vqvae = load_octgpt_vqvae(args.vqvae_ckpt, device)
 
   start_epoch = 0
   best_val_loss = math.inf
