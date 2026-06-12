@@ -15,7 +15,7 @@ from torch.utils.data import Dataset
 class OctreeConfig:
   depth: int = 8
   full_depth: int = 3
-  points_scale: float = 0.5
+  points_scale: float = 1.0
   max_points: int | None = 120000
   distort: bool = False
   noise_std: float = 0.005

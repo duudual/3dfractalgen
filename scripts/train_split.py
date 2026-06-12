@@ -41,9 +41,15 @@ def parse_args() -> argparse.Namespace:
 
   parser.add_argument("--depth", type=int, default=8)
   parser.add_argument("--full-depth", type=int, default=3)
+  parser.add_argument(
+      "--depth-stop",
+      type=int,
+      default=6,
+      help="OctGPT-style latent stop depth. Split labels are trained for "
+           "depths [full_depth, depth_stop).")
   parser.add_argument("--train-depth-low", type=int, default=None)
   parser.add_argument("--train-depth-high", type=int, default=None)
-  parser.add_argument("--points-scale", type=float, default=0.5)
+  parser.add_argument("--points-scale", type=float, default=1.0)
   parser.add_argument("--max-points", type=int, default=120000)
 
   parser.add_argument("--dim", type=int, default=256)
@@ -129,11 +135,11 @@ def split_loss_for_depth(
   model: Fractal3DGenerator,
   octree,
   parent_depth: int,
-) -> tuple[torch.Tensor | None, int, int]:
+) -> tuple[torch.Tensor | None, dict[str, int]]:
   targets, valid = child_split_targets(model, octree, parent_depth)
   total = int(valid.sum().item())
   if total == 0:
-    return None, 0, 0
+    return None, {"tokens": 0}
 
   logits, _ = model.forward_split(
     octree=octree,
@@ -148,8 +154,77 @@ def split_loss_for_depth(
   loss = (loss_per_token * valid.float()).sum() / valid.sum().clamp_min(1)
 
   pred = logits.argmax(dim=-1)
-  correct = int(((pred == targets) & valid).sum().item())
-  return loss, correct, total
+  valid_targets = targets[valid]
+  valid_pred = pred[valid]
+  split_mask = valid_targets == 1
+  leaf_mask = valid_targets == 0
+  pred_split = valid_pred == 1
+
+  stats = {
+    "target_depth": parent_depth + 1,
+    "tokens": total,
+    "correct": int((valid_pred == valid_targets).sum().item()),
+    "split_total": int(split_mask.sum().item()),
+    "split_correct": int(((valid_pred == valid_targets) & split_mask).sum().item()),
+    "leaf_total": int(leaf_mask.sum().item()),
+    "leaf_correct": int(((valid_pred == valid_targets) & leaf_mask).sum().item()),
+    "tp": int((pred_split & split_mask).sum().item()),
+    "fp": int((pred_split & leaf_mask).sum().item()),
+    "fn": int(((~pred_split) & split_mask).sum().item()),
+  }
+  return loss, stats
+
+
+def empty_stats() -> dict[str, float]:
+  return {
+    "loss_sum": 0.0,
+    "tokens": 0.0,
+    "correct": 0.0,
+    "split_total": 0.0,
+    "split_correct": 0.0,
+    "leaf_total": 0.0,
+    "leaf_correct": 0.0,
+    "tp": 0.0,
+    "fp": 0.0,
+    "fn": 0.0,
+  }
+
+
+def add_stats(
+  total: dict[str, float],
+  loss_value: float,
+  stats: dict[str, int],
+) -> None:
+  tokens = float(stats.get("tokens", 0))
+  total["loss_sum"] += loss_value * tokens
+  for key in [
+    "tokens", "correct", "split_total", "split_correct", "leaf_total",
+    "leaf_correct", "tp", "fp", "fn",
+  ]:
+    total[key] += float(stats.get(key, 0))
+
+
+def finalize_stats(total: dict[str, float]) -> dict[str, float]:
+  tokens = max(total["tokens"], 1.0)
+  split_total = max(total["split_total"], 1.0)
+  leaf_total = max(total["leaf_total"], 1.0)
+  precision_den = max(total["tp"] + total["fp"], 1.0)
+  recall_den = max(total["tp"] + total["fn"], 1.0)
+  precision = total["tp"] / precision_den
+  recall = total["tp"] / recall_den
+  f1_den = max(precision + recall, 1e-12)
+  return {
+    "loss": total["loss_sum"] / tokens,
+    "accuracy": total["correct"] / tokens,
+    "split_accuracy": total["split_correct"] / split_total,
+    "leaf_accuracy": total["leaf_correct"] / leaf_total,
+    "split_precision": precision,
+    "split_recall": recall,
+    "split_f1": 2.0 * precision * recall / f1_den,
+    "tokens": total["tokens"],
+    "split_tokens": total["split_total"],
+    "leaf_tokens": total["leaf_total"],
+  }
 
 
 def run_epoch(
@@ -169,9 +244,8 @@ def run_epoch(
   training = optimizer is not None
   model.train(training)
 
-  total_loss_sum = 0.0
-  total_tokens = 0
-  total_correct = 0
+  total_stats = empty_stats()
+  depth_stats: dict[int, dict[str, float]] = {}
 
   pbar = tqdm(
     loader,
@@ -182,23 +256,27 @@ def run_epoch(
   for batch_idx, batch in enumerate(pbar):
     octree = batch["octree_gt"].to(device)
     losses: list[torch.Tensor] = []
-    batch_tokens = 0
-    batch_correct = 0
+    batch_stats = empty_stats()
 
     for parent_depth in range(depth_low, depth_high + 1):
       if parent_depth + 1 > octree.depth:
         continue
-      loss, correct, tokens = split_loss_for_depth(model, octree, parent_depth)
+      loss, stats = split_loss_for_depth(model, octree, parent_depth)
       if loss is None:
         continue
-      losses.append(loss * tokens)
-      batch_tokens += tokens
-      batch_correct += correct
+      loss_value = float(loss.detach().item())
+      losses.append(loss * stats["tokens"])
+      add_stats(batch_stats, loss_value, stats)
 
-    if batch_tokens == 0:
+      target_depth = stats["target_depth"]
+      if target_depth not in depth_stats:
+        depth_stats[target_depth] = empty_stats()
+      add_stats(depth_stats[target_depth], loss_value, stats)
+
+    if batch_stats["tokens"] == 0:
       continue
 
-    loss = torch.stack(losses).sum() / batch_tokens
+    loss = torch.stack(losses).sum() / batch_stats["tokens"]
     if training:
       optimizer.zero_grad(set_to_none=True)
       loss.backward()
@@ -208,23 +286,28 @@ def run_epoch(
       global_step += 1
 
       if writer is not None and global_step % log_every == 0:
+        step_metrics = finalize_stats(batch_stats)
         writer.add_scalar("train/loss_step", float(loss.item()), global_step)
+        writer.add_scalar("train/accuracy_step", step_metrics["accuracy"], global_step)
         writer.add_scalar(
-          "train/accuracy_step", batch_correct / max(batch_tokens, 1), global_step)
+          "train/split_accuracy_step", step_metrics["split_accuracy"], global_step)
+        writer.add_scalar(
+          "train/leaf_accuracy_step", step_metrics["leaf_accuracy"], global_step)
+        writer.add_scalar(
+          "train/split_recall_step", step_metrics["split_recall"], global_step)
 
-    total_loss_sum += float(loss.item()) * batch_tokens
-    total_tokens += batch_tokens
-    total_correct += batch_correct
+    add_stats(total_stats, float(loss.item()), {k: int(v) for k, v in batch_stats.items()})
+    metrics_so_far = finalize_stats(total_stats)
     pbar.set_postfix(
-      loss=f"{total_loss_sum / max(total_tokens, 1):.4f}",
-      acc=f"{total_correct / max(total_tokens, 1):.4f}",
-      tokens=total_tokens,
+      loss=f"{metrics_so_far['loss']:.4f}",
+      acc=f"{metrics_so_far['accuracy']:.4f}",
+      split_rec=f"{metrics_so_far['split_recall']:.4f}",
+      tokens=int(metrics_so_far["tokens"]),
     )
 
-  metrics = {
-    "loss": total_loss_sum / max(total_tokens, 1),
-    "accuracy": total_correct / max(total_tokens, 1),
-    "tokens": float(total_tokens),
+  metrics = finalize_stats(total_stats)
+  metrics["per_depth"] = {
+    depth: finalize_stats(stats) for depth, stats in sorted(depth_stats.items())
   }
   return metrics, global_step
 
@@ -259,6 +342,34 @@ def load_checkpoint(
   return int(checkpoint["epoch"]) + 1, float(checkpoint.get("best_val_loss", math.inf))
 
 
+def write_epoch_metrics(
+  writer: SummaryWriter,
+  phase: str,
+  metrics: dict,
+  epoch: int,
+) -> None:
+  for key, value in metrics.items():
+    if key == "per_depth":
+      continue
+    writer.add_scalar(f"{phase}/{key}_epoch", value, epoch)
+
+  for depth, depth_metrics in metrics.get("per_depth", {}).items():
+    for key, value in depth_metrics.items():
+      writer.add_scalar(f"{phase}_by_depth/depth{depth}/{key}", value, epoch)
+
+
+def format_metrics(prefix: str, metrics: dict) -> str:
+  return (
+    f"{prefix}_loss={metrics['loss']:.6f} "
+    f"{prefix}_acc={metrics['accuracy']:.4f} "
+    f"{prefix}_split_acc={metrics['split_accuracy']:.4f} "
+    f"{prefix}_leaf_acc={metrics['leaf_accuracy']:.4f} "
+    f"{prefix}_split_p={metrics['split_precision']:.4f} "
+    f"{prefix}_split_r={metrics['split_recall']:.4f} "
+    f"{prefix}_split_f1={metrics['split_f1']:.4f}"
+  )
+
+
 def main() -> None:
   args = parse_args()
   set_seed(args.seed)
@@ -271,10 +382,19 @@ def main() -> None:
   train_loader, val_loader = build_loaders(args)
   depth_low = args.train_depth_low
   if depth_low is None:
-    depth_low = args.full_depth
+    depth_low = args.full_depth - 1
   depth_high = args.train_depth_high
   if depth_high is None:
-    depth_high = args.depth - 1
+    depth_high = args.depth_stop - 2
+
+  if args.depth_stop > args.depth:
+    raise ValueError("--depth-stop must be <= --depth")
+  if depth_low < 0 or depth_high < depth_low:
+    raise ValueError("Invalid train depth range")
+  print(
+    f"Training split labels for target depths "
+    f"{depth_low + 1}..{depth_high + 1} "
+    f"(parent depths {depth_low}..{depth_high}).")
 
   model = Fractal3DGenerator(
     dim=args.dim,
@@ -308,9 +428,7 @@ def main() -> None:
       epoch=epoch,
       phase="train",
     )
-    writer.add_scalar("train/loss_epoch", train_metrics["loss"], epoch)
-    writer.add_scalar("train/accuracy_epoch", train_metrics["accuracy"], epoch)
-    writer.add_scalar("train/tokens_epoch", train_metrics["tokens"], epoch)
+    write_epoch_metrics(writer, "train", train_metrics, epoch)
 
     monitor_loss = train_metrics["loss"]
     if val_loader is not None and (epoch + 1) % args.val_every == 0:
@@ -326,21 +444,12 @@ def main() -> None:
           epoch=epoch,
           phase="val",
         )
-      writer.add_scalar("val/loss_epoch", val_metrics["loss"], epoch)
-      writer.add_scalar("val/accuracy_epoch", val_metrics["accuracy"], epoch)
-      writer.add_scalar("val/tokens_epoch", val_metrics["tokens"], epoch)
+      write_epoch_metrics(writer, "val", val_metrics, epoch)
       monitor_loss = val_metrics["loss"]
-      print(
-        f"epoch {epoch:04d} "
-        f"train_loss={train_metrics['loss']:.6f} "
-        f"train_acc={train_metrics['accuracy']:.4f} "
-        f"val_loss={val_metrics['loss']:.6f} "
-        f"val_acc={val_metrics['accuracy']:.4f}")
+      print(f"epoch {epoch:04d} {format_metrics('train', train_metrics)} "
+            f"{format_metrics('val', val_metrics)}")
     else:
-      print(
-        f"epoch {epoch:04d} "
-        f"train_loss={train_metrics['loss']:.6f} "
-        f"train_acc={train_metrics['accuracy']:.4f}")
+      print(f"epoch {epoch:04d} {format_metrics('train', train_metrics)}")
 
     save_checkpoint(
       output_dir / "last.pt", model, optimizer, epoch, best_val_loss, args)

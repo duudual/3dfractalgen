@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
       help="Dataset root directory.")
   parser.add_argument("--depth", type=int, default=8)
   parser.add_argument("--full-depth", type=int, default=3)
-  parser.add_argument("--points-scale", type=float, default=0.5)
+  parser.add_argument("--points-scale", type=float, default=1.0)
   parser.add_argument("--max-points", type=int, default=120000)
   parser.add_argument("--index", type=int, default=0)
   return parser.parse_args()

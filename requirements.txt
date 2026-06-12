@@ -3,3 +3,5 @@ torch
 tensorboard
 tqdm
 ocnn
+trimesh
+mesh2sdf
