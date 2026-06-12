@@ -108,12 +108,20 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader | No
   else:
     val_set = None
 
+  loader_kwargs = {
+    "num_workers": args.num_workers,
+    "collate_fn": collate_shapes,
+    "pin_memory": str(args.device).startswith("cuda"),
+  }
+  if args.num_workers > 0:
+    loader_kwargs["persistent_workers"] = True
+    loader_kwargs["prefetch_factor"] = 2
+
   train_loader = DataLoader(
     train_set,
     batch_size=args.batch_size,
     shuffle=True,
-    num_workers=args.num_workers,
-    collate_fn=collate_shapes,
+    **loader_kwargs,
   )
   val_loader = None
   if val_set is not None:
@@ -121,8 +129,7 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader | No
       val_set,
       batch_size=args.batch_size,
       shuffle=False,
-      num_workers=args.num_workers,
-      collate_fn=collate_shapes,
+      **loader_kwargs,
     )
   return train_loader, val_loader
 

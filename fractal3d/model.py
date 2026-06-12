@@ -134,34 +134,22 @@ class Fractal3DGenerator(nn.Module):
   def _sibling_indices(self, octree, depth: int) -> torch.Tensor:
     nnum = int(octree.nnum[depth])
     device = octree.device
-    if depth <= self.full_depth:
-      starts = torch.arange(0, nnum, 8, device=device)
-    else:
-      prev_children = octree.children[depth - 1]
-      starts = prev_children[prev_children >= 0].long()
-      starts = starts[starts < nnum]
-    group = torch.empty((nnum, 8), dtype=torch.long, device=device).fill_(-1)
-    for start in starts.tolist():
-      end = min(start + 8, nnum)
-      idx = torch.arange(start, end, dtype=torch.long, device=device)
-      group[idx, :idx.numel()] = idx
-    missing = group[:, 0] < 0
-    if missing.any():
-      group[missing, 0] = torch.arange(nnum, device=device)[missing]
+    idx = torch.arange(nnum, dtype=torch.long, device=device)
+    starts = (idx // 8) * 8
+    offsets = torch.arange(8, dtype=torch.long, device=device)
+    group = starts[:, None] + offsets[None, :]
+    group = torch.where(group < nnum, group, torch.full_like(group, -1))
     return group
 
   def _child_indices(self, octree, parent_depth: int) -> torch.Tensor:
     n_parent = int(octree.nnum[parent_depth])
     n_child = int(octree.nnum[parent_depth + 1])
     device = octree.device
-    children = octree.children[parent_depth]
-    out = torch.empty((n_parent, 8), dtype=torch.long, device=device).fill_(-1)
-    valid_parent = children >= 0
-    for parent_idx in torch.nonzero(valid_parent, as_tuple=False).flatten().tolist():
-      start = int(children[parent_idx].item())
-      end = min(start + 8, n_child)
-      if start < n_child:
-        out[parent_idx, :end - start] = torch.arange(start, end, device=device)
+    children = octree.children[parent_depth].long()
+    offsets = torch.arange(8, dtype=torch.long, device=device)
+    out = children[:, None] + offsets[None, :]
+    valid = (children[:, None] >= 0) & (out < n_child)
+    out = torch.where(valid, out, torch.full((n_parent, 8), -1, dtype=torch.long, device=device))
     return out
 
   def initial_hidden(self, octree, depth: int | None = None) -> torch.Tensor:
@@ -182,13 +170,11 @@ class Fractal3DGenerator(nn.Module):
       raise ValueError(
         f"parent_hidden has {parent_hidden.shape[0]} nodes, expected {n_parent}.")
 
-    sibling_idx = self._sibling_indices(octree, parent_depth)
     parent_idx = torch.arange(n_parent, dtype=torch.long, device=octree.device)
-    uncle_idx = torch.empty((n_parent, 7), dtype=torch.long, device=octree.device).fill_(-1)
-    for row in range(n_parent):
-      sibs = sibling_idx[row]
-      sibs = sibs[(sibs >= 0) & (sibs != row)]
-      uncle_idx[row, :min(7, sibs.numel())] = sibs[:7]
+    sibling_idx = self._sibling_indices(octree, parent_depth)
+    local_id = parent_idx % 8
+    keep_uncle = torch.arange(8, dtype=torch.long, device=octree.device)[None, :] != local_id[:, None]
+    uncle_idx = sibling_idx[keep_uncle].view(n_parent, 7)
 
     valid_uncle = uncle_idx >= 0
     safe_uncle = uncle_idx.clamp(min=0)

@@ -72,12 +72,19 @@ def main() -> None:
     sample_seed=args.sample_seed,
   )
   dataset = ShapeOctreeDataset(args.data, config=config, filelist=args.filelist)
+  loader_kwargs = {
+    "num_workers": args.num_workers,
+    "collate_fn": collate_shapes,
+    "pin_memory": str(args.device).startswith("cuda"),
+  }
+  if args.num_workers > 0:
+    loader_kwargs["persistent_workers"] = True
+    loader_kwargs["prefetch_factor"] = 2
   loader = DataLoader(
     dataset,
     batch_size=1,
     shuffle=False,
-    num_workers=args.num_workers,
-    collate_fn=collate_shapes,
+    **loader_kwargs,
   )
 
   vqvae = load_octgpt_vqvae(args.vqvae_ckpt, device)

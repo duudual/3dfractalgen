@@ -134,6 +134,22 @@ def set_seed(seed: int) -> None:
 
 
 def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader | None]:
+  shape_loader_kwargs = {
+    "num_workers": args.num_workers,
+    "collate_fn": collate_shapes,
+    "pin_memory": str(args.device).startswith("cuda"),
+  }
+  uid_loader_kwargs = {
+    "num_workers": args.num_workers,
+    "collate_fn": collate_uids,
+    "pin_memory": False,
+  }
+  if args.num_workers > 0:
+    shape_loader_kwargs["persistent_workers"] = True
+    shape_loader_kwargs["prefetch_factor"] = 2
+    uid_loader_kwargs["persistent_workers"] = True
+    uid_loader_kwargs["prefetch_factor"] = 2
+
   if args.vq_cache_dir is not None:
     train_set = ShapeUidDataset(args.data, filelist=args.filelist)
     if args.val_filelist:
@@ -150,8 +166,7 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader | No
       train_set,
       batch_size=args.batch_size,
       shuffle=True,
-      num_workers=args.num_workers,
-      collate_fn=collate_uids,
+      **uid_loader_kwargs,
     )
     val_loader = None
     if val_set is not None:
@@ -159,8 +174,7 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader | No
         val_set,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_uids,
+        **uid_loader_kwargs,
       )
     return train_loader, val_loader
 
@@ -188,8 +202,7 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader | No
     train_set,
     batch_size=args.batch_size,
     shuffle=True,
-    num_workers=args.num_workers,
-    collate_fn=collate_shapes,
+    **shape_loader_kwargs,
   )
   val_loader = None
   if val_set is not None:
@@ -197,8 +210,7 @@ def build_loaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader | No
       val_set,
       batch_size=args.batch_size,
       shuffle=False,
-      num_workers=args.num_workers,
-      collate_fn=collate_shapes,
+      **shape_loader_kwargs,
     )
   return train_loader, val_loader
 
