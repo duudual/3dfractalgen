@@ -390,7 +390,7 @@ class Fractal3DGenerator(nn.Module):
     device = octree.device
     children = octree.children[parent_depth].long()
     offsets = torch.arange(8, dtype=torch.long, device=device)
-    out = children[:, None] + offsets[None, :]
+    out = children[:, None] * 8 + offsets[None, :]
     valid = (children[:, None] >= 0) & (out < n_child)
     out = torch.where(valid, out, torch.full((n_parent, 8), -1, dtype=torch.long, device=device))
     return out
