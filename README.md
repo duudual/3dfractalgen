@@ -208,6 +208,42 @@ Expected signs of a healthy implementation on 1-4 shapes:
 If this tiny run cannot overfit, inspect implementation alignment before trying
 larger training.
 
+For an even smaller split-first debug target, stop at `depth_stop=4`. The frozen
+OctGPT VQ-VAE used here has `code_depth = input_depth - 2`, so the matching
+cache command must use `--depth 6`, not `--depth 8`:
+
+```bash
+python scripts/cache_vq_tokens.py \
+  --data data/02691156 \
+  --filelist outputs/debug_filelist.txt \
+  --output-dir outputs/vq_cache_debug_d4 \
+  --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
+  --depth 6 \
+  --full-depth 3 \
+  --depth-stop 4 \
+  --overwrite
+```
+
+Then run a deterministic, beta-free split-focused overfit:
+
+```bash
+python scripts/train_vae.py \
+  --data data/02691156 \
+  --filelist outputs/debug_filelist.txt \
+  --val-fraction 0 \
+  --vq-cache-dir outputs/vq_cache_debug_d4 \
+  --output-dir outputs/vae_overfit_split_d4 \
+  --depth 6 \
+  --full-depth 3 \
+  --depth-stop 4 \
+  --beta-max 0 \
+  --lambda-vq 0 \
+  --split-pos-weight 2.0 \
+  --deterministic-z \
+  --batch-size 1 \
+  --epochs 100
+```
+
 ## Diagnostic Logs
 
 `train_vae.py` logs the following metrics per epoch and to TensorBoard:

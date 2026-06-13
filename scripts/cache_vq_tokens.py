@@ -101,8 +101,13 @@ def main() -> None:
     with torch.no_grad():
       indices, codes, code_depth = encode_bsq_tokens(vqvae, octree)
     if code_depth != args.depth_stop:
+      delta_depth = int(args.depth) - int(code_depth)
+      suggested_depth = int(args.depth_stop) + delta_depth
       raise ValueError(
-        f"{uid}: VQVAE code depth is {code_depth}, expected {args.depth_stop}.")
+        f"{uid}: VQVAE code depth is {code_depth}, expected {args.depth_stop}. "
+        f"This checkpoint maps input octree depth {args.depth} to code depth "
+        f"{code_depth} (delta_depth={delta_depth}); for depth_stop="
+        f"{args.depth_stop}, rerun with --depth {suggested_depth}.")
 
     tmp_path = path.with_suffix(".tmp")
     torch.save({

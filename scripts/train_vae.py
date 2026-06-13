@@ -75,8 +75,17 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
 
   parser.add_argument("--lambda-vq", type=float, default=1.0)
+  parser.add_argument(
+    "--split-pos-weight",
+    type=float,
+    default=1.0,
+    help="Cross-entropy weight for split=1 tokens.")
   parser.add_argument("--beta-max", type=float, default=1e-4)
   parser.add_argument("--beta-warmup-epochs", type=int, default=10)
+  parser.add_argument(
+    "--deterministic-z",
+    action="store_true",
+    help="Use z=mu instead of reparameterized z; useful for overfit debugging.")
 
   parser.add_argument("--epochs", type=int, default=100)
   parser.add_argument("--batch-size", type=int, default=1)
@@ -172,8 +181,14 @@ def split_losses(model, octree, z: torch.Tensor, args: argparse.Namespace) -> tu
       continue
     logits, child_hidden, child_indices = model.forward_split(
       octree, parent_depth, parent_hidden, parallel=args.parallel_child_train)
+    weight = None
+    if args.split_pos_weight != 1.0:
+      weight = logits.new_tensor([1.0, args.split_pos_weight])
     loss_per = F.cross_entropy(
-      logits.reshape(-1, 2), targets.reshape(-1), reduction="none").view_as(targets)
+      logits.reshape(-1, 2),
+      targets.reshape(-1),
+      reduction="none",
+      weight=weight).view_as(targets)
     tokens = int(valid.sum().item())
     losses.append((loss_per * valid.float()).sum())
     total_tokens += tokens
@@ -280,7 +295,13 @@ def load_batch_payload(
   with torch.no_grad():
     indices, _, code_depth = encode_bsq_tokens(vqvae, octree)
   if code_depth != args.depth_stop:
-    raise ValueError(f"VQVAE code depth is {code_depth}, expected {args.depth_stop}.")
+    delta_depth = int(args.depth) - int(code_depth)
+    suggested_depth = int(args.depth_stop) + delta_depth
+    raise ValueError(
+      f"VQVAE code depth is {code_depth}, expected {args.depth_stop}. "
+      f"This checkpoint maps input octree depth {args.depth} to code depth "
+      f"{code_depth} (delta_depth={delta_depth}); for depth_stop="
+      f"{args.depth_stop}, rerun with --depth {suggested_depth}.")
   return octree, indices.long()
 
 
@@ -315,7 +336,7 @@ def run_epoch(
     octree, vq_indices = load_batch_payload(batch, args, device, vqvae)
     with torch.amp.autocast("cuda", enabled=use_amp):
       mu, logvar = model.encode(octree, split_by_depth(octree, args.full_depth, args.depth_stop), vq_indices, args.depth_stop)
-      z = model.reparameterize(mu, logvar) if training else mu
+      z = mu if args.deterministic_z or not training else model.reparameterize(mu, logvar)
       s_loss, s_stats, parent_hidden = split_losses(model.decoder, octree, z, args)
       q_loss, q_stats = vq_loss(model.decoder, octree, parent_hidden, vq_indices, args)
       k_loss = model.kl_loss(mu, logvar)
