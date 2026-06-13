@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--vqvae-update-octree",
     action=argparse.BooleanOptionalAction,
-    default=False,
+    default=True,
     help="Allow the frozen VQ-VAE decoder to update octree structure during SDF decoding.")
   parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   return parser.parse_args()
@@ -164,13 +164,21 @@ def sdf_surface_points(
   device: torch.device,
   update_octree: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  for depth in range(code_depth, int(octree.depth)):
-    split = torch.zeros(int(octree.nnum[depth]), dtype=torch.int32, device=device)
-    octree.octree_split(split, depth)
-    if depth + 1 <= int(octree.depth):
-      octree.octree_grow(depth + 1, update_neigh=True)
+  octree_for_decode = copy.deepcopy(octree)
+  min_graph_depth = code_depth - vqvae.decoder.encoder_stages + 1
+  if min_graph_depth < 0:
+    raise ValueError(
+      f"Invalid VQ-VAE code depth {code_depth} for "
+      f"{vqvae.decoder.encoder_stages} encoder stages.")
+  octree_for_decode.full_depth = min(int(octree.full_depth), min_graph_depth)
 
-  doctree = OctreeD(octree)
+  for depth in range(code_depth, int(octree_for_decode.depth)):
+    split = torch.zeros(int(octree.nnum[depth]), dtype=torch.int32, device=device)
+    octree_for_decode.octree_split(split, depth)
+    if depth + 1 <= int(octree_for_decode.depth):
+      octree_for_decode.octree_grow(depth + 1, update_neigh=True)
+
+  doctree = OctreeD(octree_for_decode)
   octree_out = copy.deepcopy(doctree)
   decoded = vqvae.decode_code(
     codes, code_depth, doctree, octree_out, pos=None, update_octree=update_octree)
