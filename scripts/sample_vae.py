@@ -157,6 +157,7 @@ def sdf_surface_points(
   vqvae,
   codes: torch.Tensor,
   code_depth: int,
+  decode_depth: int,
   octree,
   num_query: int,
   num_surface: int,
@@ -165,18 +166,21 @@ def sdf_surface_points(
   update_octree: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   octree_for_decode = copy.deepcopy(octree)
-  min_graph_depth = code_depth - vqvae.decoder.encoder_stages + 1
-  if min_graph_depth < 0:
+  min_full_depth = code_depth - vqvae.decoder.encoder_stages + 1
+  if min_full_depth < 0:
     raise ValueError(
       f"Invalid VQ-VAE code depth {code_depth} for "
       f"{vqvae.decoder.encoder_stages} encoder stages.")
-  octree_for_decode.full_depth = min(int(octree.full_depth), min_graph_depth)
+  octree_for_decode.full_depth = min(int(octree.full_depth), min_full_depth)
 
-  for depth in range(code_depth, int(octree_for_decode.depth)):
-    split = torch.zeros(int(octree.nnum[depth]), dtype=torch.int32, device=device)
+  # OctGPT's VQ-VAE is trained with code_depth = final_depth - delta_depth.
+  # The decoder still needs placeholder graph levels up to final depth; with
+  # update_octree=True it predicts the missing fine split structure itself.
+  for depth in range(code_depth, decode_depth):
+    split = torch.zeros(
+      int(octree_for_decode.nnum[depth]), dtype=torch.int32, device=device)
     octree_for_decode.octree_split(split, depth)
-    if depth + 1 <= int(octree_for_decode.depth):
-      octree_for_decode.octree_grow(depth + 1, update_neigh=True)
+    octree_for_decode.octree_grow(depth + 1, update_neigh=True)
 
   doctree = OctreeD(octree_for_decode)
   octree_out = copy.deepcopy(doctree)
@@ -216,6 +220,7 @@ def main() -> None:
   saved = checkpoint.get("args", {})
   full_depth = int(saved.get("full_depth", 3))
   depth_stop = int(saved.get("depth_stop", 6))
+  decode_depth = int(saved.get("depth", depth_stop))
   z_dim = int(saved.get("z_dim", 128))
   vqvae = load_octgpt_vqvae(args.vqvae_ckpt, device)
 
@@ -240,6 +245,7 @@ def main() -> None:
           vqvae,
           codes,
           depth_stop,
+          decode_depth,
           octree,
           args.sdf_points,
           args.surface_points,
@@ -253,6 +259,8 @@ def main() -> None:
       "z": z.detach().cpu(),
       "vq_indices": vq_indices.detach().cpu(),
       "split_by_depth": split_by_depth,
+      "code_depth": depth_stop,
+      "decode_depth": decode_depth,
       "surface_points": surface,
       "surface_sdf": surface_sdf,
       "checkpoint_epoch": checkpoint.get("epoch"),
