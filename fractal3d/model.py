@@ -331,6 +331,7 @@ class Fractal3DGenerator(nn.Module):
     self.max_depth = max_depth
 
     self.z_proj = nn.Linear(z_dim, dim)
+    self.z_cond_proj = nn.Linear(z_dim, dim)
     self.role_emb = nn.Embedding(2, dim)
     self.local_pos_emb = LocalOctantPosEmb(dim)
     self.transformer = ChildARTransformer(
@@ -391,16 +392,22 @@ class Fractal3DGenerator(nn.Module):
     out = torch.where(valid, out, torch.full((n_parent, 8), -1, dtype=torch.long, device=device))
     return out
 
+  def _z_condition_for_depth(self, octree, z: torch.Tensor, depth: int) -> torch.Tensor:
+    batch_ids = octree.batch_id(depth).long()
+    return self.z_cond_proj(z)[batch_ids]
+
   def _root_children_from_z(self, octree, z: torch.Tensor, parallel: bool = False) -> torch.Tensor:
     batch_size = int(octree.batch_size)
     if z.shape[0] != batch_size:
       raise ValueError(f"z has batch {z.shape[0]}, expected {batch_size}.")
     root = self.z_proj(z)
+    z_cond = self.z_cond_proj(z)
     child_id = torch.arange(8, dtype=torch.long, device=octree.device)
     queries = self.local_pos_emb(child_id)
 
     if parallel:
-      seq = torch.cat([root.unsqueeze(1), queries.unsqueeze(0).expand(batch_size, -1, -1)], dim=1)
+      child_queries = queries.unsqueeze(0).expand(batch_size, -1, -1) + z_cond.unsqueeze(1)
+      seq = torch.cat([root.unsqueeze(1), child_queries], dim=1)
       padding = torch.zeros(batch_size, 9, dtype=torch.bool, device=octree.device)
       attn_mask = torch.zeros(9, 9, dtype=torch.bool, device=octree.device)
       attn_mask[0, 1:] = True
@@ -413,7 +420,7 @@ class Fractal3DGenerator(nn.Module):
 
     child_outputs: list[torch.Tensor] = []
     for idx in range(8):
-      query = queries[idx].expand(batch_size, 1, -1)
+      query = queries[idx].expand(batch_size, 1, -1) + z_cond.unsqueeze(1)
       if idx == 0:
         seq = torch.cat([root.unsqueeze(1), query], dim=1)
       else:
@@ -440,7 +447,7 @@ class Fractal3DGenerator(nn.Module):
         f"but z bootstrap produced {hidden.shape[0]}.")
     for parent_depth in range(1, target_depth):
       _, child_hidden, child_indices = self.forward_split(
-        octree, parent_depth, hidden, parallel=parallel)
+        octree, parent_depth, hidden, parallel=parallel, z=z)
       hidden = self.scatter_child_hidden(
         child_hidden, child_indices, int(octree.nnum[parent_depth + 1]))
     return hidden
@@ -479,18 +486,24 @@ class Fractal3DGenerator(nn.Module):
     parent_depth: int,
     parent_hidden: torch.Tensor,
     parallel: bool = False,
+    z: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
     if parallel:
-      return self.forward_children_parallel(octree, parent_depth, parent_hidden)
+      return self.forward_children_parallel(octree, parent_depth, parent_hidden, z=z)
 
     context, context_padding = self._context_tokens(octree, parent_depth, parent_hidden)
     n_parent = context.shape[0]
     child_outputs: list[torch.Tensor] = []
     child_id = torch.arange(8, dtype=torch.long, device=octree.device)
     queries = self.local_pos_emb(child_id)
+    z_cond = None
+    if z is not None:
+      z_cond = self._z_condition_for_depth(octree, z, parent_depth).unsqueeze(1)
 
     for idx in range(8):
       query = queries[idx].expand(n_parent, 1, -1)
+      if z_cond is not None:
+        query = query + z_cond
       if idx == 0:
         seq = torch.cat([context, query], dim=1)
         padding = torch.cat([
@@ -514,11 +527,14 @@ class Fractal3DGenerator(nn.Module):
     octree,
     parent_depth: int,
     parent_hidden: torch.Tensor,
+    z: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor]:
     context, context_padding = self._context_tokens(octree, parent_depth, parent_hidden)
     n_parent = context.shape[0]
     child_id = torch.arange(8, dtype=torch.long, device=octree.device)
     queries = self.local_pos_emb(child_id).unsqueeze(0).expand(n_parent, -1, -1)
+    if z is not None:
+      queries = queries + self._z_condition_for_depth(octree, z, parent_depth).unsqueeze(1)
     seq = torch.cat([context, queries], dim=1)
     padding = torch.cat([
       context_padding,
@@ -534,9 +550,10 @@ class Fractal3DGenerator(nn.Module):
     parent_depth: int,
     parent_hidden: torch.Tensor,
     parallel: bool = False,
+    z: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     child_hidden, child_indices = self.forward_children(
-      octree, parent_depth, parent_hidden, parallel=parallel)
+      octree, parent_depth, parent_hidden, parallel=parallel, z=z)
     logits = self.split_head(child_hidden)
     return logits, child_hidden, child_indices
 
@@ -546,9 +563,10 @@ class Fractal3DGenerator(nn.Module):
     parent_depth: int,
     parent_hidden: torch.Tensor,
     parallel: bool = False,
+    z: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     child_hidden, child_indices = self.forward_children(
-      octree, parent_depth, parent_hidden, parallel=parallel)
+      octree, parent_depth, parent_hidden, parallel=parallel, z=z)
     logits = self.vq_head(child_hidden)
     logits = logits.view(logits.shape[0], 8, self.vq_groups, 2)
     return logits, child_hidden, child_indices

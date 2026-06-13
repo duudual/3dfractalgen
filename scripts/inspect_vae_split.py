@@ -128,7 +128,11 @@ def main() -> None:
     parallel_child_train = False
 
   model = build_model(saved_args, device)
-  model.load_state_dict(checkpoint["model"])
+  missing, unexpected = model.load_state_dict(checkpoint["model"], strict=False)
+  if missing:
+    print(f"missing checkpoint keys: {missing}")
+  if unexpected:
+    print(f"unexpected checkpoint keys: {unexpected}")
   model.eval()
 
   config = OctreeConfig(
@@ -162,7 +166,7 @@ def main() -> None:
       for parent_depth in range(full_depth - 1, depth_stop - 1):
         targets, valid = child_split_targets(model.decoder, octree, parent_depth)
         logits, child_hidden, child_indices = model.decoder.forward_split(
-          octree, parent_depth, parent_hidden, parallel=parallel_child_train)
+          octree, parent_depth, parent_hidden, parallel=parallel_child_train, z=z)
         prob = F.softmax(logits, dim=-1)[..., 1]
         pred = (prob >= args.threshold).long()
 

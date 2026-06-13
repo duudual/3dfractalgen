@@ -62,7 +62,11 @@ def load_vae(path: str | Path, device: torch.device) -> tuple[Fractal3DVAE, dict
   checkpoint = torch.load(path, map_location=device)
   model = Fractal3DVAE(**model_args_from_checkpoint(checkpoint)).to(device)
   state = checkpoint["model"] if "model" in checkpoint else checkpoint
-  model.load_state_dict(state)
+  missing, unexpected = model.load_state_dict(state, strict=False)
+  if missing:
+    print(f"missing checkpoint keys: {missing}")
+  if unexpected:
+    print(f"unexpected checkpoint keys: {unexpected}")
   model.eval()
   return model, checkpoint
 
@@ -100,7 +104,7 @@ def sample_structure_and_vq(
 
   for parent_depth in range(full_depth - 1, depth_stop - 1):
     logits, child_hidden, child_indices = decoder.forward_split(
-      octree, parent_depth, hidden, parallel=False)
+      octree, parent_depth, hidden, parallel=False, z=z)
     sampled = sample_binary_logits(logits, temperature_split, sample_tokens).int()
     target_depth = parent_depth + 1
     split = torch.zeros(int(octree.nnum[target_depth]), dtype=torch.int32, device=device)
@@ -115,7 +119,7 @@ def sample_structure_and_vq(
         child_hidden, child_indices, int(octree.nnum[target_depth]))
 
   logits, _, child_indices = decoder.forward_vq(
-    octree, depth_stop - 1, hidden, parallel=False)
+    octree, depth_stop - 1, hidden, parallel=False, z=z)
   sampled_vq = sample_binary_logits(logits, temperature_vq, sample_tokens).long()
   indices = torch.zeros(
     int(octree.nnum[depth_stop]), decoder.vq_groups, dtype=torch.long, device=device)

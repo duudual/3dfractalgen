@@ -180,7 +180,7 @@ def split_losses(model, octree, z: torch.Tensor, args: argparse.Namespace) -> tu
     if int(valid.sum().item()) == 0:
       continue
     logits, child_hidden, child_indices = model.forward_split(
-      octree, parent_depth, parent_hidden, parallel=args.parallel_child_train)
+      octree, parent_depth, parent_hidden, parallel=args.parallel_child_train, z=z)
     weight = None
     if args.split_pos_weight != 1.0:
       weight = logits.new_tensor([1.0, args.split_pos_weight])
@@ -234,7 +234,7 @@ def split_losses(model, octree, z: torch.Tensor, args: argparse.Namespace) -> tu
   }, parent_hidden
 
 
-def vq_loss(model, octree, parent_hidden: torch.Tensor, vq_indices: torch.Tensor, args: argparse.Namespace) -> tuple[torch.Tensor, dict[str, float]]:
+def vq_loss(model, octree, parent_hidden: torch.Tensor, vq_indices: torch.Tensor, z: torch.Tensor, args: argparse.Namespace) -> tuple[torch.Tensor, dict[str, float]]:
   parent_depth = args.depth_stop - 1
   child_indices = model._child_indices(octree, parent_depth)
   valid = child_indices >= 0
@@ -242,7 +242,7 @@ def vq_loss(model, octree, parent_hidden: torch.Tensor, vq_indices: torch.Tensor
   targets = torch.where(
     valid.unsqueeze(-1), vq_indices[safe], torch.zeros_like(vq_indices[safe]))
   logits, _, _ = model.forward_vq(
-    octree, parent_depth, parent_hidden, parallel=args.parallel_child_train)
+    octree, parent_depth, parent_hidden, parallel=args.parallel_child_train, z=z)
   valid_bits = valid.unsqueeze(-1).expand_as(targets)
   if int(valid_bits.sum().item()) == 0:
     zero = parent_hidden.sum() * 0.0
@@ -338,7 +338,7 @@ def run_epoch(
       mu, logvar = model.encode(octree, split_by_depth(octree, args.full_depth, args.depth_stop), vq_indices, args.depth_stop)
       z = mu if args.deterministic_z or not training else model.reparameterize(mu, logvar)
       s_loss, s_stats, parent_hidden = split_losses(model.decoder, octree, z, args)
-      q_loss, q_stats = vq_loss(model.decoder, octree, parent_hidden, vq_indices, args)
+      q_loss, q_stats = vq_loss(model.decoder, octree, parent_hidden, vq_indices, z, args)
       k_loss = model.kl_loss(mu, logvar)
       loss = s_loss + args.lambda_vq * q_loss + beta * k_loss
       z_std = torch.exp(0.5 * torch.clamp(logvar, -30.0, 20.0))
