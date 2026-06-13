@@ -192,17 +192,18 @@ def sample_structure_and_vq(
   temperature_split: float,
   temperature_vq: float,
   sample_tokens: bool,
+  parallel_child: bool,
   device: torch.device,
 ) -> tuple[Octree, torch.Tensor, dict[int, torch.Tensor]]:
   decoder = model.decoder
   octree = init_generated_octree(full_depth, depth_stop, device)
   split_by_depth: dict[int, torch.Tensor] = {}
   hidden = decoder.bootstrap_hidden_from_z(
-    octree, z, full_depth - 1, parallel=False)
+    octree, z, full_depth - 1, parallel=parallel_child)
 
   for parent_depth in range(full_depth - 1, depth_stop - 1):
     logits, child_hidden, child_indices = decoder.forward_split(
-      octree, parent_depth, hidden, parallel=False, z=z)
+      octree, parent_depth, hidden, parallel=parallel_child, z=z)
     sampled = sample_binary_logits(logits, temperature_split, sample_tokens).int()
     target_depth = parent_depth + 1
     split = torch.zeros(int(octree.nnum[target_depth]), dtype=torch.int32, device=device)
@@ -217,7 +218,7 @@ def sample_structure_and_vq(
         child_hidden, child_indices, int(octree.nnum[target_depth]))
 
   logits, _, child_indices = decoder.forward_vq(
-    octree, depth_stop - 1, hidden, parallel=False, z=z)
+    octree, depth_stop - 1, hidden, parallel=parallel_child, z=z)
   sampled_vq = sample_binary_logits(logits, temperature_vq, sample_tokens).long()
   indices = torch.zeros(
     int(octree.nnum[depth_stop]), decoder.vq_groups, dtype=torch.long, device=device)
@@ -311,6 +312,7 @@ def main() -> None:
   depth_stop = int(saved.get("depth_stop", 6))
   decode_depth = int(saved.get("depth", depth_stop))
   z_dim = int(saved.get("z_dim", 128))
+  parallel_child = bool(saved.get("parallel_child_train", True))
   vqvae = load_octgpt_vqvae(args.vqvae_ckpt, device)
   posterior_bank = None
   if args.posterior_data is not None:
@@ -344,6 +346,7 @@ def main() -> None:
         args.temperature_split,
         args.temperature_vq,
         args.sample_tokens,
+        parallel_child,
         device,
       )
       codes = vqvae.quantizer.extract_code(vq_indices)

@@ -63,16 +63,23 @@ def child_split_targets(model, octree, parent_depth: int) -> tuple[torch.Tensor,
 
 
 @torch.no_grad()
-def teacher_forced_split_stats(model, octree, z: torch.Tensor, full_depth: int, depth_stop: int) -> tuple[dict[int, dict[str, float]], torch.Tensor]:
+def teacher_forced_split_stats(
+  model,
+  octree,
+  z: torch.Tensor,
+  full_depth: int,
+  depth_stop: int,
+  parallel_child: bool,
+) -> tuple[dict[int, dict[str, float]], torch.Tensor]:
   decoder = model.decoder
   parent_hidden = decoder.bootstrap_hidden_from_z(
-    octree, z, full_depth - 1, parallel=False)
+    octree, z, full_depth - 1, parallel=parallel_child)
   stats: dict[int, dict[str, float]] = {}
   for parent_depth in range(full_depth - 1, depth_stop - 1):
     target_depth = parent_depth + 1
     targets, valid = child_split_targets(decoder, octree, parent_depth)
     logits, child_hidden, child_indices = decoder.forward_split(
-      octree, parent_depth, parent_hidden, parallel=False, z=z)
+      octree, parent_depth, parent_hidden, parallel=parallel_child, z=z)
     pred = sample_binary_logits(
       logits, temperature=1.0, sample_tokens=False).long()
     probs = F.softmax(logits, dim=-1)[..., 1]
@@ -116,15 +123,23 @@ def format_free_stats(split_by_depth: dict[int, torch.Tensor], octree, depth_sto
 
 
 @torch.no_grad()
-def first_layer_context_stats(model, gt_octree, z: torch.Tensor, full_depth: int, depth_stop: int, device: torch.device) -> dict[str, dict[str, float]]:
+def first_layer_context_stats(
+  model,
+  gt_octree,
+  z: torch.Tensor,
+  full_depth: int,
+  depth_stop: int,
+  parallel_child: bool,
+  device: torch.device,
+) -> dict[str, dict[str, float]]:
   decoder = model.decoder
   init_octree = init_generated_octree(full_depth, depth_stop, device)
   output: dict[str, dict[str, float]] = {}
   for name, octree in [("gt", gt_octree), ("init", init_octree)]:
     hidden = decoder.bootstrap_hidden_from_z(
-      octree, z, full_depth - 1, parallel=False)
+      octree, z, full_depth - 1, parallel=parallel_child)
     logits, _, child_indices = decoder.forward_split(
-      octree, full_depth - 1, hidden, parallel=False, z=z)
+      octree, full_depth - 1, hidden, parallel=parallel_child, z=z)
     probs = F.softmax(logits, dim=-1)[..., 1]
     valid = child_indices >= 0
     children = octree.children[full_depth - 1].long()
@@ -150,6 +165,7 @@ def main() -> None:
   full_depth = int(saved.get("full_depth", 3))
   depth_stop = int(saved.get("depth_stop", 6))
   decode_depth = int(saved.get("depth", depth_stop))
+  parallel_child = bool(saved.get("parallel_child_train", True))
 
   config = OctreeConfig(
     depth=decode_depth,
@@ -173,9 +189,9 @@ def main() -> None:
       if args.posterior_noise > 0:
         z = z + args.posterior_noise * std * torch.randn_like(std)
       teacher_stats, _ = teacher_forced_split_stats(
-        model, octree, z, full_depth, depth_stop)
+        model, octree, z, full_depth, depth_stop, parallel_child)
       first_stats = first_layer_context_stats(
-        model, octree, z, full_depth, depth_stop, device)
+        model, octree, z, full_depth, depth_stop, parallel_child, device)
       free_octree, _, free_split = sample_structure_and_vq(
         model,
         z,
@@ -184,6 +200,7 @@ def main() -> None:
         args.temperature_split,
         args.temperature_vq,
         args.sample_tokens,
+        parallel_child,
         device,
       )
     print(
