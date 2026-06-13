@@ -6,6 +6,7 @@ import math
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -59,6 +60,19 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--sdf-points", type=int, default=200000)
   parser.add_argument("--surface-points", type=int, default=20000)
   parser.add_argument("--chunk-size", type=int, default=20000)
+  parser.add_argument(
+    "--export-mesh",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Export an OctGPT-style marching-cubes OBJ from the decoded SDF.")
+  parser.add_argument("--mesh-resolution", type=int, default=300)
+  parser.add_argument("--mesh-level", type=float, default=0.002)
+  parser.add_argument("--sdf-scale", type=float, default=0.9)
+  parser.add_argument(
+    "--mesh-scale",
+    type=float,
+    default=None,
+    help="Final mesh scale. Defaults to the checkpoint points_scale.")
   parser.add_argument(
     "--decode-sdf",
     action=argparse.BooleanOptionalAction,
@@ -243,18 +257,15 @@ def write_ply(path: Path, points: torch.Tensor) -> None:
 
 
 @torch.no_grad()
-def sdf_surface_points(
+def decode_vqvae(
   vqvae,
   codes: torch.Tensor,
   code_depth: int,
   decode_depth: int,
   octree,
-  num_query: int,
-  num_surface: int,
-  chunk_size: int,
   device: torch.device,
   update_octree: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
+):
   octree_for_decode = copy.deepcopy(octree)
   min_full_depth = code_depth - vqvae.decoder.encoder_stages + 1
   if min_full_depth < 0:
@@ -270,14 +281,41 @@ def sdf_surface_points(
     split = torch.zeros(
       int(octree_for_decode.nnum[depth]), dtype=torch.int32, device=device)
     octree_for_decode.octree_split(split, depth)
-    octree_for_decode.octree_grow(depth + 1, update_neigh=True)
+    octree_for_decode.octree_grow(depth + 1)
 
   doctree = OctreeD(octree_for_decode)
   octree_out = copy.deepcopy(doctree)
-  decoded = vqvae.decode_code(
+  return vqvae.decode_code(
     codes, code_depth, doctree, octree_out, pos=None, update_octree=update_octree)
-  neural_mpu = decoded["neural_mpu"]
 
+
+@torch.no_grad()
+def sdf_surface_points(
+  vqvae,
+  codes: torch.Tensor,
+  code_depth: int,
+  decode_depth: int,
+  octree,
+  num_query: int,
+  num_surface: int,
+  chunk_size: int,
+  device: torch.device,
+  update_octree: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  decoded = decode_vqvae(
+    vqvae, codes, code_depth, decode_depth, octree, device, update_octree)
+  return sdf_surface_points_from_mpu(
+    decoded["neural_mpu"], num_query, num_surface, chunk_size, device)
+
+
+@torch.no_grad()
+def sdf_surface_points_from_mpu(
+  neural_mpu,
+  num_query: int,
+  num_surface: int,
+  chunk_size: int,
+  device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
   keep_points: list[torch.Tensor] = []
   keep_sdf: list[torch.Tensor] = []
   remaining = num_query
@@ -301,6 +339,60 @@ def sdf_surface_points(
   return points[idx], sdf[idx]
 
 
+@torch.no_grad()
+def calc_field_values(
+  model,
+  size: int,
+  max_batch: int,
+  bbmin: float,
+  bbmax: float,
+  device: torch.device,
+) -> np.ndarray:
+  total = size ** 3
+  values = []
+  for start in range(0, total, max_batch):
+    end = min(start + max_batch, total)
+    idx = torch.arange(start, end, device=device)
+    x = torch.div(idx, size * size, rounding_mode="floor")
+    rem = idx - x * size * size
+    y = torch.div(rem, size, rounding_mode="floor")
+    z = rem - y * size
+    xyz = torch.stack((x, y, z), dim=1).float()
+    xyz = xyz / size * (bbmax - bbmin) + bbmin
+    batch_id = torch.zeros(xyz.shape[0], 1, device=device)
+    sdf = model(torch.cat([xyz, batch_id], dim=1))
+    if sdf.dim() > 1:
+      sdf = sdf[:, 0]
+    values.append(sdf.detach().cpu())
+  return torch.cat(values, dim=0).reshape(size, size, size).numpy()
+
+
+def create_mesh(
+  model,
+  filename: Path,
+  size: int,
+  level: float,
+  bbmin: float,
+  bbmax: float,
+  mesh_scale: float,
+  device: torch.device,
+  max_batch: int = 64 ** 3,
+) -> None:
+  import skimage.measure
+  import trimesh
+
+  filename.parent.mkdir(parents=True, exist_ok=True)
+  values = calc_field_values(model, size, max_batch, bbmin, bbmax, device)
+  vertices, faces, _, _ = skimage.measure.marching_cubes(values, level)
+  vertices = vertices * ((bbmax - bbmin) / size) + bbmin
+  vertices = vertices * mesh_scale
+  mesh = trimesh.Trimesh(vertices, faces)
+  components = mesh.split(only_watertight=True)
+  if components:
+    mesh = trimesh.util.concatenate(components)
+  mesh.export(filename)
+
+
 def main() -> None:
   args = parse_args()
   device = torch.device(args.device)
@@ -313,6 +405,9 @@ def main() -> None:
   decode_depth = int(saved.get("depth", depth_stop))
   z_dim = int(saved.get("z_dim", 128))
   parallel_child = bool(saved.get("parallel_child_train", True))
+  mesh_scale = args.mesh_scale
+  if mesh_scale is None:
+    mesh_scale = float(saved.get("points_scale", 1.0))
   vqvae = load_octgpt_vqvae(args.vqvae_ckpt, device)
   posterior_bank = None
   if args.posterior_data is not None:
@@ -352,18 +447,23 @@ def main() -> None:
       codes = vqvae.quantizer.extract_code(vq_indices)
       surface = torch.empty(0, 3)
       surface_sdf = torch.empty(0)
+      decoded = None
       if args.decode_sdf:
-        surface, surface_sdf = sdf_surface_points(
+        decoded = decode_vqvae(
           vqvae,
           codes,
           depth_stop,
           decode_depth,
           octree,
+          device,
+          args.vqvae_update_octree,
+        )
+        surface, surface_sdf = sdf_surface_points_from_mpu(
+          decoded["neural_mpu"],
           args.sdf_points,
           args.surface_points,
           args.chunk_size,
           device,
-          args.vqvae_update_octree,
         )
 
     stem = f"{index:04d}"
@@ -382,6 +482,17 @@ def main() -> None:
     }, output_dir / f"{stem}_sample.pt")
     if args.decode_sdf:
       write_ply(output_dir / f"{stem}_surface.ply", surface)
+      if args.export_mesh and decoded is not None:
+        create_mesh(
+          decoded["neural_mpu"],
+          output_dir / f"{stem}.obj",
+          args.mesh_resolution,
+          args.mesh_level,
+          -args.sdf_scale,
+          args.sdf_scale,
+          mesh_scale,
+          device,
+        )
     print(
       f"sample={index} nodes_depth_stop={int(octree.nnum[depth_stop])} "
       f"splits={{{', '.join(f'{depth}: {int(split.sum())}' for depth, split in split_by_depth.items())}}} "

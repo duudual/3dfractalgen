@@ -22,8 +22,10 @@ from fractal3d import OctreeConfig, ShapeOctreeDataset, collate_shapes  # noqa: 
 from fractal3d.octgpt_vqvae import load_octgpt_vqvae  # noqa: E402
 from ognn.octreed import OctreeD  # noqa: E402
 from sample_vae import (  # noqa: E402
+  create_mesh,
   load_vae,
   sample_structure_and_vq,
+  sdf_surface_points_from_mpu,
   write_ply,
 )
 from train_vae import batch_uid, load_cached_tokens, split_by_depth  # noqa: E402
@@ -49,6 +51,19 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--sdf-points", type=int, default=200000)
   parser.add_argument("--surface-points", type=int, default=20000)
   parser.add_argument("--chunk-size", type=int, default=20000)
+  parser.add_argument(
+    "--export-mesh",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Export OctGPT-style marching-cubes OBJ files for each debug case.")
+  parser.add_argument("--mesh-resolution", type=int, default=300)
+  parser.add_argument("--mesh-level", type=float, default=0.002)
+  parser.add_argument("--sdf-scale", type=float, default=0.9)
+  parser.add_argument(
+    "--mesh-scale",
+    type=float,
+    default=None,
+    help="Final mesh scale. Defaults to the checkpoint points_scale.")
   parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   return parser.parse_args()
 
@@ -123,34 +138,19 @@ def decode_surface(
       int(octree_for_decode.nnum[depth]), dtype=torch.int32,
       device=octree_for_decode.device)
     octree_for_decode.octree_split(split, depth)
-    octree_for_decode.octree_grow(depth + 1, update_neigh=True)
+    octree_for_decode.octree_grow(depth + 1)
 
   doctree = OctreeD(octree_for_decode)
   octree_out = copy.deepcopy(doctree)
   decoded = vqvae.decode_code(
     codes, code_depth, doctree, octree_out, pos=None, update_octree=True)
-  neural_mpu = decoded["neural_mpu"]
-
-  keep_points: list[torch.Tensor] = []
-  keep_sdf: list[torch.Tensor] = []
-  remaining = args.sdf_points
-  while remaining > 0:
-    count = min(args.chunk_size, remaining)
-    xyz = torch.rand(count, 3, device=octree.device) * 2.0 - 1.0
-    batch_id = torch.zeros(count, 1, device=octree.device)
-    sdf = neural_mpu(torch.cat([xyz, batch_id], dim=1))
-    if sdf.dim() > 1:
-      sdf = sdf[:, 0]
-    take = min(args.surface_points, count)
-    _, idx = torch.topk(sdf.abs(), k=take, largest=False)
-    keep_points.append(xyz[idx].detach().cpu())
-    keep_sdf.append(sdf[idx].detach().cpu())
-    remaining -= count
-
-  points = torch.cat(keep_points, dim=0)
-  sdf = torch.cat(keep_sdf, dim=0)
-  take = min(args.surface_points, points.shape[0])
-  _, idx = torch.topk(sdf.abs(), k=take, largest=False)
+  points, sdf = sdf_surface_points_from_mpu(
+    decoded["neural_mpu"],
+    args.sdf_points,
+    args.surface_points,
+    args.chunk_size,
+    octree.device,
+  )
 
   split_stats = {}
   for depth, logits in decoded["logits"].items():
@@ -165,7 +165,7 @@ def decode_surface(
     "sdf_min_abs": float(sdf.abs().min().item()),
     "sdf_median_abs": float(sdf.abs().median().item()),
   }
-  return points[idx], sdf[idx], stats
+  return points, sdf, stats, decoded
 
 
 def save_case(
@@ -179,9 +179,20 @@ def save_case(
   args: argparse.Namespace,
 ) -> dict[str, object]:
   codes = vqvae.quantizer.extract_code(indices)
-  surface, surface_sdf, stats = decode_surface(
+  surface, surface_sdf, stats, decoded = decode_surface(
     vqvae, codes, code_depth, decode_depth, octree, args)
   write_ply(output_dir / f"{name}.ply", surface)
+  if args.export_mesh:
+    create_mesh(
+      decoded["neural_mpu"],
+      output_dir / f"{name}.obj",
+      args.mesh_resolution,
+      args.mesh_level,
+      -args.sdf_scale,
+      args.sdf_scale,
+      args.mesh_scale,
+      octree.device,
+    )
   torch.save({
     "indices": indices.detach().cpu(),
     "surface_points": surface,
@@ -204,6 +215,8 @@ def main() -> None:
   decode_depth = int(saved.get("depth", depth_stop))
   z_dim = int(saved.get("z_dim", 128))
   parallel_child = bool(saved.get("parallel_child_train", True))
+  if args.mesh_scale is None:
+    args.mesh_scale = float(saved.get("points_scale", 1.0))
 
   config = OctreeConfig(
     depth=decode_depth,
