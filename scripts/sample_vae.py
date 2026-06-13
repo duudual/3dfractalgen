@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import sys
 from pathlib import Path
@@ -36,6 +37,16 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--sdf-points", type=int, default=200000)
   parser.add_argument("--surface-points", type=int, default=20000)
   parser.add_argument("--chunk-size", type=int, default=20000)
+  parser.add_argument(
+    "--decode-sdf",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Decode sampled VQ codes with the frozen VQ-VAE and export surface PLY.")
+  parser.add_argument(
+    "--vqvae-update-octree",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Allow the frozen VQ-VAE decoder to update octree structure during SDF decoding.")
   parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
   return parser.parse_args()
 
@@ -153,6 +164,7 @@ def sdf_surface_points(
   num_surface: int,
   chunk_size: int,
   device: torch.device,
+  update_octree: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
   for depth in range(code_depth, int(octree.depth)):
     split = torch.zeros(int(octree.nnum[depth]), dtype=torch.int32, device=device)
@@ -161,8 +173,9 @@ def sdf_surface_points(
       octree.octree_grow(depth + 1, update_neigh=True)
 
   doctree = OctreeD(octree)
+  octree_out = copy.deepcopy(doctree)
   decoded = vqvae.decode_code(
-    codes, code_depth, doctree, OctreeD(octree), pos=None, update_octree=True)
+    codes, code_depth, doctree, octree_out, pos=None, update_octree=update_octree)
   neural_mpu = decoded["neural_mpu"]
 
   keep_points: list[torch.Tensor] = []
@@ -214,16 +227,20 @@ def main() -> None:
         device,
       )
       codes = vqvae.quantizer.extract_code(vq_indices)
-      surface, surface_sdf = sdf_surface_points(
-        vqvae,
-        codes,
-        depth_stop,
-        octree,
-        args.sdf_points,
-        args.surface_points,
-        args.chunk_size,
-        device,
-      )
+      surface = torch.empty(0, 3)
+      surface_sdf = torch.empty(0)
+      if args.decode_sdf:
+        surface, surface_sdf = sdf_surface_points(
+          vqvae,
+          codes,
+          depth_stop,
+          octree,
+          args.sdf_points,
+          args.surface_points,
+          args.chunk_size,
+          device,
+          args.vqvae_update_octree,
+        )
 
     stem = f"{index:04d}"
     torch.save({
@@ -235,10 +252,11 @@ def main() -> None:
       "checkpoint_epoch": checkpoint.get("epoch"),
       "checkpoint_best_val_loss": checkpoint.get("best_val_loss", math.nan),
     }, output_dir / f"{stem}_sample.pt")
-    write_ply(output_dir / f"{stem}_surface.ply", surface)
+    if args.decode_sdf:
+      write_ply(output_dir / f"{stem}_surface.ply", surface)
     print(
       f"sample={index} nodes_depth_stop={int(octree.nnum[depth_stop])} "
-      f"saved={output_dir / f'{stem}_surface.ply'}")
+      f"saved={output_dir / f'{stem}_sample.pt'}")
 
 
 if __name__ == "__main__":
