@@ -18,7 +18,7 @@ DEFAULT_VQVAE_CKPT = PROJECT_ROOT / "ckpt" / "vqvae_large_im5_uncond_bsq32.pth"
 
 from fractal3d import Fractal3DVAE  # noqa: E402
 from fractal3d.octgpt_vqvae import load_octgpt_vqvae  # noqa: E402
-from ocnn.octree import Octree  # noqa: E402
+from ocnn.octree import Octree, init_octree as ocnn_init_octree  # noqa: E402
 from ognn.octreed import OctreeD  # noqa: E402
 
 
@@ -89,11 +89,9 @@ def sample_binary_logits(logits: torch.Tensor, temperature: float, sample_tokens
   return logits.argmax(dim=-1)
 
 
-def init_octree(full_depth: int, depth_stop: int, device: torch.device) -> Octree:
-  octree = Octree(depth=depth_stop, full_depth=full_depth, device=device)
-  for depth in range(full_depth + 1):
-    octree.octree_grow_full(depth, update_neigh=True)
-  return octree
+def init_generated_octree(full_depth: int, depth_stop: int, device: torch.device) -> Octree:
+  return ocnn_init_octree(
+    depth=depth_stop, full_depth=full_depth, batch_size=1, device=device)
 
 
 @torch.no_grad()
@@ -108,7 +106,7 @@ def sample_structure_and_vq(
   device: torch.device,
 ) -> tuple[Octree, torch.Tensor, dict[int, torch.Tensor]]:
   decoder = model.decoder
-  octree = init_octree(full_depth, depth_stop, device)
+  octree = init_generated_octree(full_depth, depth_stop, device)
   split_by_depth: dict[int, torch.Tensor] = {}
   hidden = decoder.bootstrap_hidden_from_z(
     octree, z, full_depth - 1, parallel=False)
