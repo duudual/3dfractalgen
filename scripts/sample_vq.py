@@ -61,9 +61,9 @@ def parse_args() -> argparse.Namespace:
 def model_args_from_checkpoint(checkpoint: dict, args: argparse.Namespace) -> dict:
   saved = checkpoint.get("args", {})
   return {
-    "dim": int(saved.get("dim", 128)),
-    "num_layers": int(saved.get("layers", 4)),
-    "num_heads": int(saved.get("heads", 4)),
+    "dim": int(saved.get("dim", 192)),
+    "num_layers": int(saved.get("layers", 6)),
+    "num_heads": int(saved.get("heads", 6)),
     "num_vq_embed": int(saved.get("num_vq_embed", 32)),
     "vq_groups": int(saved.get("vq_groups", 32)),
     "full_depth": int(saved.get("full_depth", args.full_depth)),
@@ -103,34 +103,9 @@ def predict_structure(
   sample_tokens: bool,
   temperature: float,
 ) -> tuple[Octree, dict[int, torch.Tensor]]:
-  octree = Octree(depth=code_depth, full_depth=full_depth, device=device)
-  for depth in range(full_depth + 1):
-    octree.octree_grow_full(depth, update_neigh=True)
-
-  split_by_depth: dict[int, torch.Tensor] = {}
-  parent_depth = full_depth - 1
-  parent_hidden = model.initial_hidden(octree, parent_depth)
-  for split_depth in range(full_depth, code_depth):
-    logits, child_hidden, child_indices = model.forward_split(
-      octree, parent_depth, parent_hidden)
-    if sample_tokens:
-      probs = F.softmax(logits / temperature, dim=-1)
-      sampled = torch.multinomial(probs.reshape(-1, 2), num_samples=1)
-      sampled = sampled.view(logits.shape[0], 8)
-    else:
-      sampled = logits.argmax(dim=-1)
-    valid = child_indices >= 0
-    safe_idx = child_indices.clamp(min=0)
-    split = torch.zeros(
-      int(octree.nnum[split_depth]), dtype=torch.int32, device=device)
-    split[safe_idx[valid]] = sampled[valid].int()
-    split_by_depth[split_depth] = split.detach().cpu()
-    octree.octree_split(split, split_depth)
-    octree.octree_grow(split_depth + 1, update_neigh=True)
-    parent_hidden = model.scatter_child_hidden(
-      child_hidden, child_indices, int(octree.nnum[split_depth]))
-    parent_depth = split_depth
-  return octree, split_by_depth
+  raise RuntimeError(
+    "sample_vq.py is obsolete after switching to the z-conditioned VAE path. "
+    "Use scripts/sample_vae.py.")
 
 
 def predict_depth_vq(
@@ -141,29 +116,9 @@ def predict_depth_vq(
   temperature: float,
   sample_tokens: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  parent_depth = code_depth - 1
-  n_code = int(octree.nnum[code_depth])
-  pred_indices = torch.zeros(
-    n_code, model.vq_groups, dtype=torch.long, device=octree.device)
-
-  parent_hidden = model.initial_hidden(octree, model.full_depth - 1)
-  for depth in range(model.full_depth - 1, parent_depth):
-    _, child_hidden, child_idx = model.forward_split(octree, depth, parent_hidden)
-    parent_hidden = model.scatter_child_hidden(
-      child_hidden, child_idx, int(octree.nnum[depth + 1]))
-
-  logits, _, child_idx = model.forward_vq(octree, parent_depth, parent_hidden)
-  if sample_tokens:
-    probs = F.softmax(logits / temperature, dim=-1)
-    token = torch.multinomial(probs.reshape(-1, 2), num_samples=1)
-    child_indices = token.view(logits.shape[0], 8, model.vq_groups)
-  else:
-    child_indices = logits.argmax(dim=-1)
-  valid = child_idx >= 0
-  safe_idx = child_idx.clamp(min=0)
-  pred_indices[safe_idx[valid]] = child_indices[valid]
-  pred_codes = vqvae.quantizer.extract_code(pred_indices)
-  return pred_indices, pred_codes, valid
+  raise RuntimeError(
+    "sample_vq.py is obsolete after switching to the z-conditioned VAE path. "
+    "Use scripts/sample_vae.py.")
 
 
 def predict_depth_vq_teacher_forced(
@@ -174,20 +129,9 @@ def predict_depth_vq_teacher_forced(
   gt_indices: torch.Tensor,
   gt_codes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  parent_depth = code_depth - 1
-  parent_hidden = model.initial_hidden(octree, model.full_depth - 1)
-  for depth in range(model.full_depth - 1, parent_depth):
-    _, child_hidden, child_idx = model.forward_split(octree, depth, parent_hidden)
-    parent_hidden = model.scatter_child_hidden(
-      child_hidden, child_idx, int(octree.nnum[depth + 1]))
-  logits, _, child_idx = model.forward_vq(octree, parent_depth, parent_hidden)
-  pred_child = logits.argmax(dim=-1)
-  pred_indices = torch.zeros_like(gt_indices)
-  valid = child_idx >= 0
-  safe_idx = child_idx.clamp(min=0)
-  pred_indices[safe_idx[valid]] = pred_child[valid]
-  pred_codes = vqvae.quantizer.extract_code(pred_indices)
-  return pred_indices, pred_codes, valid
+  raise RuntimeError(
+    "sample_vq.py is obsolete after switching to the z-conditioned VAE path. "
+    "Use scripts/sample_vae.py.")
 
 
 def split_structure_metrics(
@@ -381,6 +325,9 @@ def save_vq_sample(
 
 def main() -> None:
   args = parse_args()
+  raise RuntimeError(
+    "sample_vq.py is obsolete after switching to the z-conditioned VAE path. "
+    "Use scripts/sample_vae.py for z-conditioned VAE sampling.")
   device = torch.device(args.device)
   output_dir = Path(args.output_dir)
   output_dir.mkdir(parents=True, exist_ok=True)

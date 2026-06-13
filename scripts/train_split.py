@@ -53,9 +53,9 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--points-scale", type=float, default=1.0)
   parser.add_argument("--max-points", type=int, default=120000)
 
-  parser.add_argument("--dim", type=int, default=128)
-  parser.add_argument("--layers", type=int, default=4)
-  parser.add_argument("--heads", type=int, default=4)
+  parser.add_argument("--dim", type=int, default=192)
+  parser.add_argument("--layers", type=int, default=6)
+  parser.add_argument("--heads", type=int, default=6)
   parser.add_argument("--dropout", type=float, default=0.1)
   parser.add_argument(
     "--parallel-child-train",
@@ -283,9 +283,9 @@ def run_epoch(
     octree = batch["octree_gt"].to(device)
     losses: list[torch.Tensor] = []
     batch_stats = empty_stats()
-    hidden_by_depth: dict[int, torch.Tensor] = {
-      depth_low: model.initial_hidden(octree, depth_low)
-    }
+    raise RuntimeError(
+      "train_split.py is obsolete after switching to the z-conditioned VAE path. "
+      "Use scripts/train_vae.py.")
 
     for parent_depth in range(depth_low, depth_high + 1):
       if parent_depth + 1 > octree.depth:
@@ -411,6 +411,9 @@ def format_metrics(prefix: str, metrics: dict) -> str:
 
 def main() -> None:
   args = parse_args()
+  raise RuntimeError(
+    "train_split.py is obsolete after switching to the z-conditioned VAE path. "
+    "Use scripts/train_vae.py for the z-conditioned VAE decoder.")
   set_seed(args.seed)
 
   output_dir = Path(args.output_dir)

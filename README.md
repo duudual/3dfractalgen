@@ -1,47 +1,26 @@
-## project 描述
-将 Kaiming He 等人提出的分形自回归模型 (Fractal Generative Model) 从二维图像生成拓展到三维形
-状生成。分形自回归模型通过递归调用自回归生成模块，将复杂图像分解为多层级、局部化的生成过
-程。3D数据尤其是八叉树结构天然具有层级空间结构，因此可结合八叉树表示，将三维空间递归划分
-为多个子区域，并在每一层使用自回归模型预测子区域的占据状态、分裂情况和局部几何特征。项目
-将参考 OctGPT 中的八叉树建模与多尺度3D生成思路，尝试构建一种从粗到细生成3D形状的分形自回
-归框架，并在简单3D数据集如ShapeNet的airplane类上验证其可行性。
+# 3DFractalGen
 
-## 核心设计
-采用分形思想，父伯子：现在已经求出第i层节点，要预测第i层节点的分裂情况，使用AR，传入的数据是该i层节点的同属于一个i-1层父节点的兄弟的token和该节点的token，以及要预测8个子节点的token,组成一个seq，经过transformer，使用AR得到每个属于i+1层的子节点的token，然后经过一个预测head预测每个节点的split or no split. 最终生成具体的点的内容复用OctGPT的 VQ-VAE 模块.
-这种父伯子的建模方式，是分型思想的小块内可独自预测，与OctGPT的一次预测第i层所有的不同.这种设计本身避免了OctGPT可能出现第i层节点数过多时，由于父节点顺序排放在最前面，导致的没法看到父节点，而只能通过dilated_window等方式间接看到的缺陷,因为每次都是一个小局部，局部attention很适用.
+3DFractalGen explores a VAE-style, top-down fractal octree generator for 3D
+shape generation. The current implementation uses:
 
-接下来我要进行这样的修改：1.要使用parent hidden state,uncle的找法是找当前父节点的8个子节点，这些节点不论最终是否split，都会有hidden state,这些拿来。child预测
-  的内容也是hidden state,然后用split head预测split情况; 2. 删除split embedding,因为child会用hidden state; 3.删除mask token,因为完全使用AR; 4.VQ也是对hiddenstate
-  通过vq_head预测; 5.role embedding只区分parent和uncle，因为预测child时都是用hidden state,不需要child embedding; 6.absolute 3D position embedding我要进行修改改
-  成局部位置坐标.octgpt这样做是因为它局限在单个小物体的单独空间中，前面说到过uncle要改成固定window在z-order序列上找节点了，这里的位置编码就修改成因为固定有八个
-  节点嘛，同时这八个的排列顺序要依据位置固定，可以是看z-order的前后顺序，然后position embedding改成用 child_id 的 3-bit 局部坐标编码
-  每个 child id 可以拆成 3 个 bit：
-  octant_pos = sx * emb_x + sy * emb_y + sz * emb_z. emb_x,y,z是可学习的embedding.这个是要和role embedding一起加入到parent/uncle hiddenstate的
+- an OctFormer-style local-window encoder over GT octree split tokens and
+  OctGPT VQ/BSQ tokens;
+- a shape-level latent variable `z`;
+- a parent/sibling hidden-state autoregressive decoder;
+- the frozen OctGPT VQ-VAE decoder to convert generated VQ codes into an
+  implicit SDF/MPU field.
 
-  - 模型结构：
-      - 删除 split_emb、mask_token、vq_proj 作为 child AR 输入的用途。
-      - role_emb 改成 2 类：parent 和 uncle；child query 不使用 role embedding。
-      - 新增 learnable seed_token 初始化 full_depth 节点 hidden。
-      - 新增 LocalOctantPosEmb：三个可学习向量 emb_x/emb_y/emb_z，按 OCNN child 顺序计算：
-          - x = id & 1
-          - y = (id >> 1) & 1
-          - z = (id >> 2) & 1
-          - octant_pos = sx * emb_x + sy * emb_y + sz * emb_z
+The decoder starts from:
 
-      - 删除/弃用 AbsPosEmb 在该模型中的使用。
+```text
+root hidden = z_proj(z)
+```
 
-  - AR hidden 生成：
-      - 对每个 parent，context 是它所在 sibling group 的 8 个同层节点 hidden。
-      - 当前 parent 加 parent role embedding，其他 7 个 sibling 加 uncle role embedding。
-      - sibling group 不按缺失处理：只对真实存在于当前 depth 的节点建组；由 split 父节点产生的 8 个 child 都拥有 hidden state，即使它们最终不 split。
-      - 预测 child k 时输入：
-          - 8 个 parent/sibling context hidden
-          - 已生成的 0..k-1 child hidden
-          - 当前 child 的 query：octant_pos(k)
+Then it generates the 8 root-child hidden states and recursively expands hidden
+states down the octree. There is no `seed_token` or `initial_hidden` path in the
+current VAE workflow.
 
-      - Transformer 输出当前 query 的 hidden，作为 child k 的 hidden state。
-      - 8 个 child hidden 全部生成后 scatter 到下一层 hidden buffer；只有真实/预测存在的 child indices 参与下一层结构。
-## ShapeNet octree preprocessing
+## Data Preparation
 
 The raw ShapeNet category directory is expected to contain samples like:
 
@@ -56,57 +35,322 @@ cd 3dfractalgen
 python scripts/prepare_shapenet_pointclouds.py --data data/02691156 --points 200000
 ```
 
-This writes `pointcloud.npz` into each shape directory. Each file contains:
+This writes `pointcloud.npz` into each shape directory:
 
 - `points`: sampled surface points, shape `[N, 3]`, `float16`
 - `normals`: corresponding face normals, shape `[N, 3]`, `float16`
 
-The preprocessing follows OctGPT's ShapeNet convention: meshes are normalized
-to a centered unit cube, scaled by `--mesh-scale 0.8`, and sampled with
-`trimesh.sample.sample_surface` when `trimesh` is installed. The octree
-dataset therefore uses `points_scale=1.0` by default.
-
-Then verify OCNN octree construction:
+Verify OCNN octree construction:
 
 ```bash
 python scripts/inspect_octree.py --data data/02691156 --depth 8 --full-depth 3
 ```
 
-For a quick smoke test on only a few meshes:
+For a quick smoke test:
 
 ```bash
-python scripts/prepare_shapenet_pointclouds.py --data data/02691156 --points 4096 --limit 2 --output-root outputs/airplane_pointcloud_smoke --overwrite
-python scripts/inspect_octree.py --data outputs/airplane_pointcloud_smoke --depth 8 --full-depth 3
+python scripts/prepare_shapenet_pointclouds.py \
+  --data data/02691156 \
+  --points 4096 \
+  --limit 2 \
+  --output-root outputs/airplane_pointcloud_smoke \
+  --overwrite
+
+python scripts/inspect_octree.py \
+  --data outputs/airplane_pointcloud_smoke \
+  --depth 8 \
+  --full-depth 3
 ```
 
-To keep preprocessed data separate from raw ShapeNet meshes, use:
+## VQ Token Cache
+
+VAE training needs GT VQ/BSQ tokens from the frozen OctGPT VQ-VAE. Caching them
+is recommended.
+
+Expected checkpoint:
+
+```text
+ckpt/vqvae_large_im5_uncond_bsq32.pth
+```
+
+Cache tokens:
 
 ```bash
-python scripts/prepare_shapenet_pointclouds.py --data data/02691156 --output-root data/02691156_pointcloud
-python scripts/inspect_octree.py --data data/02691156_pointcloud --depth 8 --full-depth 3
+python scripts/cache_vq_tokens.py \
+  --data data/02691156 \
+  --output-dir outputs/vq_cache \
+  --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
+  --depth 8 \
+  --full-depth 3 \
+  --depth-stop 6 \
+  --num-vq-embed 32 \
+  --vq-groups 32
 ```
 
-To also generate OctGPT-style SDF supervision for VQ-VAE/SDF training, install
-`mesh2sdf` and add `--with-sdf`:
+Each cached file stores:
+
+- `indices`: BSQ bit indices, shape `[num_code_nodes, 32]`
+- `codes`: quantized VQ code vectors
+- `code_depth`: expected to equal `--depth-stop`
+- metadata for depth, full depth, data scale, and VQ dimensions
+
+## Train VAE
+
+Run joint VAE training:
 
 ```bash
-python scripts/prepare_shapenet_pointclouds.py --data data/02691156 --output-root data/02691156_sdf --with-sdf
+python scripts/train_vae.py \
+  --data data/02691156 \
+  --vq-cache-dir outputs/vq_cache \
+  --output-dir outputs/vae_train \
+  --depth 8 \
+  --full-depth 3 \
+  --depth-stop 6 \
+  --dim 192 \
+  --z-dim 128 \
+  --encoder-layers 6 \
+  --decoder-layers 6 \
+  --encoder-patch-size 1024 \
+  --encoder-dilation 8 \
+  --heads 6 \
+  --vq-groups 32 \
+  --num-vq-embed 32 \
+  --lambda-vq 1.0 \
+  --beta-max 1e-4 \
+  --beta-warmup-epochs 10 \
+  --batch-size 1 \
+  --epochs 100
 ```
 
-This additionally writes `sdf.npz` into each output shape directory:
-
-- `points`: SDF query points in `[-1, 1]`, shape `[M, 3]`, `float16`
-- `grad`: interpolated SDF gradients, shape `[M, 3]`, `float16`
-- `sdf`: signed distance values, shape `[M]`, `float16`
-
-The SDF path mirrors `octgpt/tools/sample_sdf.py`: it computes a `2 ** depth`
-SDF grid with `mesh2sdf`, builds an OCNN octree from the sampled surface point
-cloud, samples random query points inside octree nodes, interpolates SDF values
-and gradients, and saves up to `--sdf-max-samples 400000` samples per shape.
-
-To write `pointcloud.npz` back into each raw shape directory, omit `--output-root`:
+Without a cache, `train_vae.py` can encode VQ tokens online with the frozen
+VQ-VAE:
 
 ```bash
-python scripts/prepare_shapenet_pointclouds.py --data data/02691156 --points 200000
-python scripts/inspect_octree.py --data data/02691156 --depth 8 --full-depth 3
+python scripts/train_vae.py \
+  --data data/02691156 \
+  --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
+  --output-dir outputs/vae_train_online \
+  --depth 8 \
+  --full-depth 3 \
+  --depth-stop 6
 ```
+
+The training loss is:
+
+```text
+total = split_loss + lambda_vq * vq_loss + beta * KL(q(z|x) || N(0,I))
+```
+
+`beta` linearly warms up to `--beta-max` over `--beta-warmup-epochs`.
+
+TensorBoard logs are written to:
+
+```text
+outputs/vae_train/tensorboard
+```
+
+Checkpoints:
+
+```text
+outputs/vae_train/last.pt
+outputs/vae_train/best.pt
+```
+
+## Sample From VAE
+
+Generate samples from random latent vectors:
+
+```bash
+python scripts/sample_vae.py \
+  --vae-ckpt outputs/vae_train/best.pt \
+  --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
+  --output-dir outputs/vae_samples \
+  --num-samples 8 \
+  --temperature-split 1.0 \
+  --temperature-vq 1.0 \
+  --sample-tokens
+```
+
+For deterministic argmax sampling:
+
+```bash
+python scripts/sample_vae.py \
+  --vae-ckpt outputs/vae_train/best.pt \
+  --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
+  --output-dir outputs/vae_samples_argmax \
+  --num-samples 8 \
+  --no-sample-tokens
+```
+
+Sampling writes:
+
+- `*_sample.pt`: latent `z`, predicted split tokens, predicted VQ indices,
+  near-surface points, and SDF values
+- `*_surface.ply`: near-surface point cloud sampled from the decoded SDF field
+
+The current sampler exports near-surface point clouds rather than marching-cubes
+meshes. It is intended as a fast qualitative check for the generated implicit
+field.
+
+## Current Model Flow
+
+Training:
+
+```text
+GT octree split tokens + GT VQ bits
+        -> OctFormer-style encoder
+        -> mu, logvar
+        -> z
+        -> z-conditioned parent/sibling decoder
+        -> split logits + VQ logits
+```
+
+Generation:
+
+```text
+z ~ N(0, I)
+        -> root hidden = z_proj(z)
+        -> root 8 child hidden states
+        -> recursive split sampling
+        -> VQ bit sampling at depth_stop
+        -> frozen OctGPT VQ-VAE decode_code
+        -> SDF/MPU field
+        -> near-surface point cloud
+```
+
+The old split-only and VQ-only scripts are obsolete because they depended on the
+removed seed-based initialization path. Use:
+
+```text
+scripts/train_vae.py
+scripts/sample_vae.py
+```
+
+## Design Notes
+
+### Project Description
+
+将 Kaiming He 等人提出的分形自回归模型 (Fractal Generative Model)
+从二维图像生成拓展到三维形状生成。分形自回归模型通过递归调用
+自回归生成模块，将复杂图像分解为多层级、局部化的生成过程。
+
+3D 数据尤其是八叉树结构天然具有层级空间结构，因此可结合八叉树
+表示，将三维空间递归划分为多个子区域，并在每一层使用自回归模型
+预测子区域的占据状态、分裂情况和局部几何特征。项目参考 OctGPT
+中的八叉树建模与多尺度 3D 生成思路，尝试构建一种从粗到细生成
+3D 形状的分形自回归框架，并在 ShapeNet airplane 类上验证其可行性。
+
+### Core Idea: Parent / Uncle / Child Modeling
+
+采用分形思想，使用“父-伯-子”的局部生成方式。假设现在已经求出
+第 `i` 层节点，要预测第 `i+1` 层子节点的分裂情况，则对每个 parent
+构造一个局部 AR 序列：
+
+```text
+parent/sibling hidden context
+已生成 child hidden
+当前 child query
+```
+
+经过 Transformer 后得到每个属于 `i+1` 层的 child hidden，再通过
+预测 head 判断每个 child 是否 split。最终具体几何内容复用 OctGPT
+的 VQ-VAE 模块。
+
+这种父伯子的建模方式，是分形思想下的小块局部预测，和 OctGPT
+一次预测第 `i` 层所有节点不同。它避免了当第 `i` 层节点数过多时，
+父节点信息在长序列中距离过远、只能通过 dilated window 等方式间接
+看到的问题；因为每次建模的都是一个小局部，所以局部 attention 更适用。
+
+### Hidden-State Decoder Design
+
+核心修改思路：
+
+- 使用 parent hidden state 和 uncle hidden state。
+- uncle 的找法是当前 parent 所在 sibling group 中的其他 7 个节点。
+- 这些同层节点不论最终是否 split，都会有 hidden state。
+- child 预测的内容也是 hidden state，然后用 `split_head` 预测 split。
+- 删除 split embedding 和 mask token 作为 child AR 输入的用途。
+- VQ 也通过 `vq_head(hidden)` 预测。
+- `role_emb` 只区分 parent 和 uncle。
+- child query 不使用 role embedding，而使用局部 octant position。
+- 弃用全局 absolute 3D position embedding，改为局部位置坐标。
+
+局部位置编码使用 child id 的 3-bit octant 坐标：
+
+```text
+x = id & 1
+y = (id >> 1) & 1
+z = (id >> 2) & 1
+
+octant_pos = sx * emb_x + sy * emb_y + sz * emb_z
+```
+
+其中 `emb_x / emb_y / emb_z` 是可学习向量。这个位置编码用于 child
+query，也用于 encoder token 的局部位置标识。
+
+AR hidden 生成方式：
+
+- 对每个 parent，context 是它所在 sibling group 的 8 个同层节点 hidden。
+- 当前 parent 加 parent role embedding。
+- 其他 7 个 sibling 加 uncle role embedding。
+- 预测 child `k` 时输入：
+
+```text
+8 个 parent/sibling context hidden
+已生成的 0..k-1 child hidden
+当前 child 的 query: octant_pos(k)
+```
+
+Transformer 输出当前 query 的 hidden，作为 child `k` 的 hidden state。
+8 个 child hidden 全部生成后 scatter 到下一层 hidden buffer；只有真实或
+预测存在的 child indices 参与下一层结构。
+
+### Why VAE
+
+一个关键问题是：生成模型生成“具体哪一个实例”的条件从何处来？
+
+固定某个类别时，OctGPT 每层八叉树生成都有随机性；FractalGen 中一个
+patch 会递归生成到底层图案。但它们都不是从一开始就显式知道“这个类别
+中具体要生成哪一个实例”。
+
+当前父伯 hidden-state 设计隐含一个假设：从最上层 root 开始就应该知道
+整体形状是什么。这更符合人们对生成模型的直觉，但如果直接把 root 设计
+成一个随机采样量，学习不到结构化 latent；类似结构的 shape，其根部表示
+按理应该接近，而无监督随机 root 做不到这一点。
+
+因此采用 VAE 思路：
+
+```text
+GT octree / GT VQ tokens
+        -> encoder
+        -> latent z
+        -> decoder 起始条件
+        -> split / VQ prediction losses
+```
+
+最终生成时，从 prior 中随机采样 `z` 来生成。
+
+### TreeVAE / FractalOctreeVAE
+
+```text
+Encoder:
+  OctFormer-style encoder:
+  GT octree structure + VQ tokens -> mu, logvar
+
+Latent:
+  z = mu + exp(0.5 * logvar) * eps
+
+Decoder:
+  root hidden = z_proj(z)
+  root hidden -> first 8 child hidden states
+  parent/sibling hidden AR -> child hidden
+  child hidden -> split logits / VQ logits
+
+Loss:
+  split CE + VQ CE + beta KL
+```
+
+Historical note: an earlier design considered
+`full-depth hidden = seed + z_proj(z) + local octant pos`, but the current
+implementation removes `seed_token`; the root hidden is fully determined by
+`z_proj(z)`.

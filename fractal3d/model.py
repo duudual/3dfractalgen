@@ -69,16 +69,255 @@ class ChildARTransformer(nn.Module):
     return self.norm(x)
 
 
+class LocalOctreeAttention(nn.Module):
+  """Windowed sequence attention used by the VAE token encoder."""
+
+  def __init__(
+    self,
+    dim: int,
+    num_heads: int,
+    patch_size: int = 1024,
+    dilation: int = 1,
+    dropout: float = 0.1,
+    use_swin: bool = False,
+  ) -> None:
+    super().__init__()
+    self.dim = dim
+    self.num_heads = num_heads
+    self.patch_size = patch_size
+    self.dilation = dilation
+    self.use_swin = use_swin
+    self.qkv = nn.Linear(dim, dim * 3)
+    self.proj = nn.Linear(dim, dim)
+    self.dropout = dropout
+
+  def _attention_pass(
+    self,
+    x: torch.Tensor,
+    padding: torch.Tensor,
+    dilation: int,
+  ) -> torch.Tensor:
+    bsz, seq_len, dim = x.shape
+    block = self.patch_size * dilation
+    pad_len = (block - seq_len % block) % block
+    if pad_len:
+      x = torch.cat([x, x.new_zeros(bsz, pad_len, dim)], dim=1)
+      padding = torch.cat([
+        padding,
+        torch.ones(bsz, pad_len, dtype=torch.bool, device=x.device),
+      ], dim=1)
+    padded_len = x.shape[1]
+
+    qkv = self.qkv(x).view(bsz, padded_len, 3, self.num_heads, dim // self.num_heads)
+    qkv = qkv.permute(2, 0, 1, 3, 4)
+    q, k, v = qkv[0], qkv[1], qkv[2]
+
+    if dilation > 1:
+      q = q.view(bsz, -1, self.patch_size, dilation, self.num_heads, dim // self.num_heads)
+      k = k.view_as(q)
+      v = v.view_as(q)
+      q = q.transpose(2, 3).reshape(-1, self.patch_size, self.num_heads, dim // self.num_heads)
+      k = k.transpose(2, 3).reshape_as(q)
+      v = v.transpose(2, 3).reshape_as(q)
+      mask = padding.view(bsz, -1, self.patch_size, dilation)
+      mask = mask.transpose(2, 3).reshape(-1, self.patch_size)
+    else:
+      q = q.view(-1, self.patch_size, self.num_heads, dim // self.num_heads)
+      k = k.view_as(q)
+      v = v.view_as(q)
+      mask = padding.view(-1, self.patch_size)
+
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    attn_mask = mask[:, None, None, :]
+    out = F.scaled_dot_product_attention(
+      q,
+      k,
+      v,
+      attn_mask=attn_mask.logical_not(),
+      dropout_p=self.dropout if self.training else 0.0,
+    )
+    out = out.transpose(1, 2).reshape(-1, self.patch_size, dim)
+
+    if dilation > 1:
+      out = out.view(bsz, -1, dilation, self.patch_size, dim)
+      out = out.transpose(2, 3).reshape(bsz, padded_len, dim)
+    else:
+      out = out.view(bsz, padded_len, dim)
+    return self.proj(out[:, :seq_len])
+
+  def forward(self, x: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
+    if self.use_swin:
+      shift = self.patch_size // 2
+      x_shift = torch.roll(x, shifts=-shift, dims=1)
+      pad_shift = torch.roll(padding, shifts=-shift, dims=1)
+      out = self._attention_pass(x_shift, pad_shift, self.dilation)
+      return torch.roll(out, shifts=shift, dims=1)
+    return self._attention_pass(x, padding, self.dilation)
+
+
+class LocalOctreeEncoderBlock(nn.Module):
+  def __init__(
+    self,
+    dim: int,
+    num_heads: int,
+    patch_size: int,
+    dilation: int,
+    dropout: float,
+    use_swin: bool,
+  ) -> None:
+    super().__init__()
+    self.norm1 = nn.LayerNorm(dim)
+    self.attn = LocalOctreeAttention(
+      dim, num_heads, patch_size, dilation, dropout, use_swin)
+    self.norm2 = nn.LayerNorm(dim)
+    self.mlp = nn.Sequential(
+      nn.Linear(dim, dim * 4),
+      nn.GELU(),
+      nn.Dropout(dropout),
+      nn.Linear(dim * 4, dim),
+      nn.Dropout(dropout),
+    )
+
+  def forward(self, x: torch.Tensor, padding: torch.Tensor) -> torch.Tensor:
+    x = x + self.attn(self.norm1(x), padding)
+    x = x + self.mlp(self.norm2(x))
+    return x
+
+
+class OctreeTokenEncoder(nn.Module):
+  """OctFormer-style encoder that maps GT split/VQ tokens to a shape latent."""
+
+  def __init__(
+    self,
+    dim: int,
+    z_dim: int = 128,
+    num_layers: int = 6,
+    num_heads: int = 6,
+    vq_groups: int = 32,
+    max_depth: int = 8,
+    patch_size: int = 1024,
+    dilation: int = 8,
+    use_swin: bool = True,
+    dropout: float = 0.1,
+  ) -> None:
+    super().__init__()
+    self.layers = nn.ModuleList([
+      LocalOctreeEncoderBlock(
+        dim=dim,
+        num_heads=num_heads,
+        patch_size=patch_size,
+        dilation=1 if i % 2 == 0 else dilation,
+        dropout=dropout,
+        use_swin=use_swin and ((i // 2) % 2 == 1),
+      )
+      for i in range(num_layers)
+    ])
+    self.norm = nn.LayerNorm(dim)
+    self.split_emb = nn.Embedding(2, dim)
+    self.vq_proj = nn.Linear(vq_groups, dim)
+    self.type_emb = nn.Embedding(2, dim)
+    self.depth_emb = nn.Embedding(max_depth + 1, dim)
+    self.local_pos_emb = LocalOctantPosEmb(dim)
+    self.mu_head = nn.Linear(dim, z_dim)
+    self.logvar_head = nn.Linear(dim, z_dim)
+    self.vq_groups = vq_groups
+    self.max_depth = max_depth
+    self._init_weights()
+
+  def _init_weights(self) -> None:
+    for module in self.modules():
+      if isinstance(module, nn.Linear):
+        nn.init.xavier_uniform_(module.weight)
+        if module.bias is not None:
+          nn.init.zeros_(module.bias)
+      elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, std=0.02)
+    nn.init.normal_(self.local_pos_emb.emb_x, std=0.02)
+    nn.init.normal_(self.local_pos_emb.emb_y, std=0.02)
+    nn.init.normal_(self.local_pos_emb.emb_z, std=0.02)
+
+  def _batch_ids(self, octree, depth: int) -> torch.Tensor:
+    return octree.batch_id(depth).long()
+
+  def _depth_tokens(
+    self,
+    octree,
+    depth: int,
+    token_data: torch.Tensor,
+    token_type: int,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    device = token_data.device
+    nnum = token_data.shape[0]
+    child_id = torch.arange(nnum, device=device) % 8
+    depth_id = torch.full((nnum,), depth, dtype=torch.long, device=device)
+    depth_id = depth_id.clamp(max=self.max_depth)
+
+    if token_type == 0:
+      token = self.split_emb(token_data.long())
+    else:
+      token = self.vq_proj(token_data.float())
+    token = token + self.type_emb.weight[token_type]
+    token = token + self.depth_emb(depth_id)
+    token = token + self.local_pos_emb(child_id)
+    return token, self._batch_ids(octree, depth)
+
+  def forward(
+    self,
+    octree,
+    split_by_depth: dict[int, torch.Tensor],
+    vq_indices: torch.Tensor,
+    depth_stop: int,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    tokens: list[torch.Tensor] = []
+    batch_ids: list[torch.Tensor] = []
+    for depth in sorted(split_by_depth):
+      token, batch_id = self._depth_tokens(
+        octree, depth, split_by_depth[depth].to(octree.device), token_type=0)
+      tokens.append(token)
+      batch_ids.append(batch_id)
+
+    token, batch_id = self._depth_tokens(
+      octree, depth_stop, vq_indices.to(octree.device), token_type=1)
+    tokens.append(token)
+    batch_ids.append(batch_id)
+
+    flat = torch.cat(tokens, dim=0)
+    flat_batch = torch.cat(batch_ids, dim=0)
+    batch_size = int(octree.batch_size)
+    max_len = max(int((flat_batch == i).sum().item()) for i in range(batch_size))
+    seq = flat.new_zeros(batch_size, max_len, flat.shape[-1])
+    padding = torch.ones(batch_size, max_len, dtype=torch.bool, device=flat.device)
+
+    for batch_idx in range(batch_size):
+      mask = flat_batch == batch_idx
+      count = int(mask.sum().item())
+      if count == 0:
+        continue
+      seq[batch_idx, :count] = flat[mask]
+      padding[batch_idx, :count] = False
+
+    encoded = seq
+    for layer in self.layers:
+      encoded = layer(encoded, padding)
+    encoded = self.norm(encoded)
+    valid = (~padding).to(encoded.dtype).unsqueeze(-1)
+    pooled = (encoded * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
+    return self.mu_head(pooled), self.logvar_head(pooled)
+
+
 class Fractal3DGenerator(nn.Module):
   """Parent/sibling hidden-state AR generator for octree split and VQ tokens."""
 
   def __init__(
     self,
-    dim: int = 128,
-    num_layers: int = 4,
-    num_heads: int = 4,
+    dim: int = 192,
+    num_layers: int = 6,
+    num_heads: int = 6,
     num_vq_embed: int = 256,
     vq_groups: Optional[int] = None,
+    z_dim: int = 128,
     full_depth: int = 3,
     max_depth: int = 8,
     dropout: float = 0.1,
@@ -87,10 +326,11 @@ class Fractal3DGenerator(nn.Module):
     self.dim = dim
     self.num_vq_embed = num_vq_embed
     self.vq_groups = vq_groups or num_vq_embed
+    self.z_dim = z_dim
     self.full_depth = full_depth
     self.max_depth = max_depth
 
-    self.seed_token = nn.Parameter(torch.zeros(1, dim))
+    self.z_proj = nn.Linear(z_dim, dim)
     self.role_emb = nn.Embedding(2, dim)
     self.local_pos_emb = LocalOctantPosEmb(dim)
     self.transformer = ChildARTransformer(
@@ -119,7 +359,6 @@ class Fractal3DGenerator(nn.Module):
     return mask
 
   def _init_weights(self) -> None:
-    nn.init.normal_(self.seed_token, std=0.02)
     nn.init.normal_(self.local_pos_emb.emb_x, std=0.02)
     nn.init.normal_(self.local_pos_emb.emb_y, std=0.02)
     nn.init.normal_(self.local_pos_emb.emb_z, std=0.02)
@@ -152,12 +391,59 @@ class Fractal3DGenerator(nn.Module):
     out = torch.where(valid, out, torch.full((n_parent, 8), -1, dtype=torch.long, device=device))
     return out
 
-  def initial_hidden(self, octree, depth: int | None = None) -> torch.Tensor:
-    depth = self.full_depth if depth is None else depth
-    nnum = int(octree.nnum[depth])
-    device = octree.device
-    child_id = torch.arange(nnum, device=device) % 8
-    return self.seed_token.to(device).expand(nnum, -1) + self.local_pos_emb(child_id)
+  def _root_children_from_z(self, octree, z: torch.Tensor, parallel: bool = False) -> torch.Tensor:
+    batch_size = int(octree.batch_size)
+    if z.shape[0] != batch_size:
+      raise ValueError(f"z has batch {z.shape[0]}, expected {batch_size}.")
+    root = self.z_proj(z)
+    child_id = torch.arange(8, dtype=torch.long, device=octree.device)
+    queries = self.local_pos_emb(child_id)
+
+    if parallel:
+      seq = torch.cat([root.unsqueeze(1), queries.unsqueeze(0).expand(batch_size, -1, -1)], dim=1)
+      padding = torch.zeros(batch_size, 9, dtype=torch.bool, device=octree.device)
+      attn_mask = torch.zeros(9, 9, dtype=torch.bool, device=octree.device)
+      attn_mask[0, 1:] = True
+      for query in range(1, 9):
+        for key in range(1, 9):
+          if key > query:
+            attn_mask[query, key] = True
+      hidden = self.transformer(seq, padding, attn_mask=attn_mask)
+      return hidden[:, 1:9].reshape(batch_size * 8, self.dim)
+
+    child_outputs: list[torch.Tensor] = []
+    for idx in range(8):
+      query = queries[idx].expand(batch_size, 1, -1)
+      if idx == 0:
+        seq = torch.cat([root.unsqueeze(1), query], dim=1)
+      else:
+        prev = torch.stack(child_outputs, dim=1)
+        seq = torch.cat([root.unsqueeze(1), prev, query], dim=1)
+      padding = torch.zeros(seq.shape[:2], dtype=torch.bool, device=octree.device)
+      hidden = self.transformer(seq, padding)
+      child_outputs.append(hidden[:, -1])
+    return torch.stack(child_outputs, dim=1).reshape(batch_size * 8, self.dim)
+
+  def bootstrap_hidden_from_z(
+    self,
+    octree,
+    z: torch.Tensor,
+    target_depth: int,
+    parallel: bool = False,
+  ) -> torch.Tensor:
+    if target_depth < 1:
+      raise ValueError("target_depth must be >= 1 for z bootstrap.")
+    hidden = self._root_children_from_z(octree, z, parallel=parallel)
+    if int(octree.nnum[1]) != hidden.shape[0]:
+      raise ValueError(
+        f"Octree depth 1 has {int(octree.nnum[1])} nodes, "
+        f"but z bootstrap produced {hidden.shape[0]}.")
+    for parent_depth in range(1, target_depth):
+      _, child_hidden, child_indices = self.forward_split(
+        octree, parent_depth, hidden, parallel=parallel)
+      hidden = self.scatter_child_hidden(
+        child_hidden, child_indices, int(octree.nnum[parent_depth + 1]))
+    return hidden
 
   def _context_tokens(
     self,
@@ -303,3 +589,66 @@ class Fractal3DGenerator(nn.Module):
     valid_bits = valid.unsqueeze(-1).expand_as(vq_indices)
     return F.cross_entropy(
       logits[valid_bits].reshape(-1, 2), vq_indices[valid_bits].reshape(-1).long())
+
+
+class Fractal3DVAE(nn.Module):
+  """VAE wrapper around an OctFormer-style encoder and Fractal3D decoder."""
+
+  def __init__(
+    self,
+    dim: int = 192,
+    z_dim: int = 128,
+    encoder_layers: int = 6,
+    decoder_layers: int = 6,
+    num_heads: int = 6,
+    num_vq_embed: int = 32,
+    vq_groups: int = 32,
+    full_depth: int = 3,
+    max_depth: int = 8,
+    encoder_patch_size: int = 1024,
+    encoder_dilation: int = 8,
+    dropout: float = 0.1,
+  ) -> None:
+    super().__init__()
+    self.encoder = OctreeTokenEncoder(
+      dim=dim,
+      z_dim=z_dim,
+      num_layers=encoder_layers,
+      num_heads=num_heads,
+      vq_groups=vq_groups,
+      max_depth=max_depth,
+      patch_size=encoder_patch_size,
+      dilation=encoder_dilation,
+      dropout=dropout,
+    )
+    self.decoder = Fractal3DGenerator(
+      dim=dim,
+      num_layers=decoder_layers,
+      num_heads=num_heads,
+      num_vq_embed=num_vq_embed,
+      vq_groups=vq_groups,
+      z_dim=z_dim,
+      full_depth=full_depth,
+      max_depth=max_depth,
+      dropout=dropout,
+    )
+
+  @staticmethod
+  def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    logvar = torch.clamp(logvar, -30.0, 20.0)
+    std = torch.exp(0.5 * logvar)
+    return mu + std * torch.randn_like(std)
+
+  @staticmethod
+  def kl_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    logvar = torch.clamp(logvar, -30.0, 20.0)
+    return 0.5 * (mu.pow(2) + logvar.exp() - 1.0 - logvar).sum(dim=1).mean()
+
+  def encode(
+    self,
+    octree,
+    split_by_depth: dict[int, torch.Tensor],
+    vq_indices: torch.Tensor,
+    depth_stop: int,
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    return self.encoder(octree, split_by_depth, vq_indices, depth_stop)

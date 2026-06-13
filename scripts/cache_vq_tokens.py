@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--points-scale", type=float, default=1.0)
   parser.add_argument("--max-points", type=int, default=120000)
   parser.add_argument("--sample-seed", type=int, default=0)
-  parser.add_argument("--dim", type=int, default=128)
+  parser.add_argument("--dim", type=int, default=192)
   parser.add_argument("--num-vq-embed", type=int, default=32)
   parser.add_argument("--vq-groups", type=int, default=32)
 

@@ -91,9 +91,9 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--max-points", type=int, default=120000)
   parser.add_argument("--sample-seed", type=int, default=0)
 
-  parser.add_argument("--dim", type=int, default=128)
-  parser.add_argument("--layers", type=int, default=4)
-  parser.add_argument("--heads", type=int, default=4)
+  parser.add_argument("--dim", type=int, default=192)
+  parser.add_argument("--layers", type=int, default=6)
+  parser.add_argument("--heads", type=int, default=6)
   parser.add_argument("--dropout", type=float, default=0.1)
   parser.add_argument(
       "--parallel-child-train",
@@ -241,13 +241,9 @@ def hidden_at_depth(
   target_depth: int,
   parallel_child_train: bool,
 ) -> torch.Tensor:
-  hidden = model.initial_hidden(octree, start_depth)
-  for parent_depth in range(start_depth, target_depth):
-    _, child_hidden, child_indices = model.forward_split(
-      octree, parent_depth, hidden, parallel=parallel_child_train)
-    hidden = model.scatter_child_hidden(
-      child_hidden, child_indices, int(octree.nnum[parent_depth + 1]))
-  return hidden
+  raise RuntimeError(
+    "train_vq.py is obsolete after switching to the z-conditioned VAE path. "
+    "Use scripts/train_vae.py.")
 
 
 def vq_loss_for_batch(
@@ -515,6 +511,9 @@ def format_metrics(prefix: str, metrics: dict[str, float]) -> str:
 
 def main() -> None:
   args = parse_args()
+  raise RuntimeError(
+    "train_vq.py is obsolete after switching to the z-conditioned VAE path. "
+    "Use scripts/train_vae.py for the z-conditioned VAE decoder.")
   set_seed(args.seed)
   device = torch.device(args.device)
 
