@@ -178,8 +178,9 @@ def sample_binary_logits(logits: torch.Tensor, temperature: float, sample_tokens
 
 
 def init_generated_octree(full_depth: int, depth_stop: int, device: torch.device) -> Octree:
+  del depth_stop
   return ocnn_init_octree(
-    depth=depth_stop, full_depth=full_depth, batch_size=1, device=device)
+    depth=full_depth, full_depth=full_depth, batch_size=1, device=device)
 
 
 @torch.no_grad()
