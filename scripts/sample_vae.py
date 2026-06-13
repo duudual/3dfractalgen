@@ -31,6 +31,11 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--temperature-split", type=float, default=1.0)
   parser.add_argument("--temperature-vq", type=float, default=1.0)
   parser.add_argument(
+    "--z-scale",
+    type=float,
+    default=1.0,
+    help="Scale standard-normal latent samples before decoding.")
+  parser.add_argument(
     "--sample-tokens",
     action=argparse.BooleanOptionalAction,
     default=True)
@@ -225,7 +230,7 @@ def main() -> None:
   vqvae = load_octgpt_vqvae(args.vqvae_ckpt, device)
 
   for index in range(args.num_samples):
-    z = torch.randn(1, z_dim, device=device)
+    z = torch.randn(1, z_dim, device=device) * args.z_scale
     with torch.no_grad():
       octree, vq_indices, split_by_depth = sample_structure_and_vq(
         model,
@@ -270,6 +275,7 @@ def main() -> None:
       write_ply(output_dir / f"{stem}_surface.ply", surface)
     print(
       f"sample={index} nodes_depth_stop={int(octree.nnum[depth_stop])} "
+      f"splits={{{', '.join(f'{depth}: {int(split.sum())}' for depth, split in split_by_depth.items())}}} "
       f"saved={output_dir / f'{stem}_sample.pt'}")
 
 
