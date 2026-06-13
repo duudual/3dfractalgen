@@ -17,6 +17,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
 
 from fractal3d import OctreeConfig, ShapeOctreeDataset, collate_shapes  # noqa: E402
 from sample_vae import (  # noqa: E402
+  init_generated_octree,
   load_cached_tokens,
   load_vae,
   sample_binary_logits,
@@ -114,6 +115,33 @@ def format_free_stats(split_by_depth: dict[int, torch.Tensor], octree, depth_sto
   return " | ".join(chunks)
 
 
+@torch.no_grad()
+def first_layer_context_stats(model, gt_octree, z: torch.Tensor, full_depth: int, depth_stop: int, device: torch.device) -> dict[str, dict[str, float]]:
+  decoder = model.decoder
+  init_octree = init_generated_octree(full_depth, depth_stop, device)
+  output: dict[str, dict[str, float]] = {}
+  for name, octree in [("gt", gt_octree), ("init", init_octree)]:
+    hidden = decoder.bootstrap_hidden_from_z(
+      octree, z, full_depth - 1, parallel=False)
+    logits, _, child_indices = decoder.forward_split(
+      octree, full_depth - 1, hidden, parallel=False, z=z)
+    probs = F.softmax(logits, dim=-1)[..., 1]
+    valid = child_indices >= 0
+    children = octree.children[full_depth - 1].long()
+    output[name] = {
+      "n_parent": float(int(octree.nnum[full_depth - 1])),
+      "n_child": float(int(octree.nnum[full_depth])),
+      "children_valid": float(children.ge(0).sum().item()),
+      "children_min": float(children.min().item()),
+      "children_max": float(children.max().item()),
+      "child_indices_valid": float(valid.sum().item()),
+      "logit_pred_split": float(logits.argmax(dim=-1)[valid].float().sum().item()),
+      "prob_mean": float(probs[valid].mean().item()) if valid.any() else 0.0,
+      "prob_max": float(probs[valid].max().item()) if valid.any() else 0.0,
+    }
+  return output
+
+
 def main() -> None:
   args = parse_args()
   device = torch.device(args.device)
@@ -146,6 +174,8 @@ def main() -> None:
         z = z + args.posterior_noise * std * torch.randn_like(std)
       teacher_stats, _ = teacher_forced_split_stats(
         model, octree, z, full_depth, depth_stop)
+      first_stats = first_layer_context_stats(
+        model, octree, z, full_depth, depth_stop, device)
       free_octree, _, free_split = sample_structure_and_vq(
         model,
         z,
@@ -161,6 +191,7 @@ def main() -> None:
       f"mu_abs={float(mu.abs().mean().item()):.4f} "
       f"std={float(std.mean().item()):.4f}")
     print(f"  teacher: {format_depth_stats(teacher_stats)}")
+    print(f"  first_context: {first_stats}")
     print(f"  free:    {format_free_stats(free_split, free_octree, depth_stop)}")
 
 
