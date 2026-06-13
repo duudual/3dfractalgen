@@ -334,6 +334,7 @@ class Fractal3DGenerator(nn.Module):
     self.z_cond_proj = nn.Linear(z_dim, dim)
     self.role_emb = nn.Embedding(2, dim)
     self.local_pos_emb = LocalOctantPosEmb(dim)
+    self.path_pos_emb = nn.Parameter(torch.zeros(max_depth, 3, dim))
     self.transformer = ChildARTransformer(
       dim=dim, num_layers=num_layers, num_heads=num_heads, dropout=dropout)
     self.split_head = nn.Linear(dim, 2)
@@ -363,6 +364,7 @@ class Fractal3DGenerator(nn.Module):
     nn.init.normal_(self.local_pos_emb.emb_x, std=0.02)
     nn.init.normal_(self.local_pos_emb.emb_y, std=0.02)
     nn.init.normal_(self.local_pos_emb.emb_z, std=0.02)
+    nn.init.normal_(self.path_pos_emb, std=0.02)
     for module in self.modules():
       if isinstance(module, nn.Linear):
         nn.init.xavier_uniform_(module.weight)
@@ -392,6 +394,57 @@ class Fractal3DGenerator(nn.Module):
     out = torch.where(valid, out, torch.full((n_parent, 8), -1, dtype=torch.long, device=device))
     return out
 
+  def _node_path_pos_emb(self, octree, depth: int) -> torch.Tensor:
+    nnum = int(octree.nnum[depth])
+    device = octree.device
+    if depth <= 0:
+      return torch.zeros(nnum, self.dim, dtype=self.path_pos_emb.dtype, device=device)
+
+    if hasattr(octree, "keys"):
+      key = octree.keys[depth].long()
+      morton = key & ((1 << (3 * depth)) - 1)
+      pos = torch.zeros(nnum, self.dim, dtype=self.path_pos_emb.dtype, device=device)
+      for level in range(min(depth, self.max_depth)):
+        child_id = (morton >> (3 * level)) & 7
+        x_bit = child_id & 1
+        y_bit = (child_id >> 1) & 1
+        z_bit = (child_id >> 2) & 1
+        sx = (2 * x_bit - 1).to(dtype=pos.dtype).unsqueeze(-1)
+        sy = (2 * y_bit - 1).to(dtype=pos.dtype).unsqueeze(-1)
+        sz = (2 * z_bit - 1).to(dtype=pos.dtype).unsqueeze(-1)
+        pos = (
+          pos
+          + sx * self.path_pos_emb[level, 0]
+          + sy * self.path_pos_emb[level, 1]
+          + sz * self.path_pos_emb[level, 2]
+        )
+      return pos
+
+    idx = torch.arange(nnum, dtype=torch.long, device=device)
+    pos = torch.zeros(nnum, self.dim, dtype=self.path_pos_emb.dtype, device=device)
+    for level in range(min(depth, self.max_depth)):
+      child_id = (idx >> (3 * level)) & 7
+      x_bit = child_id & 1
+      y_bit = (child_id >> 1) & 1
+      z_bit = (child_id >> 2) & 1
+      sx = (2 * x_bit - 1).to(dtype=pos.dtype).unsqueeze(-1)
+      sy = (2 * y_bit - 1).to(dtype=pos.dtype).unsqueeze(-1)
+      sz = (2 * z_bit - 1).to(dtype=pos.dtype).unsqueeze(-1)
+      pos = (
+        pos
+        + sx * self.path_pos_emb[level, 0]
+        + sy * self.path_pos_emb[level, 1]
+        + sz * self.path_pos_emb[level, 2]
+      )
+    return pos
+
+  def _child_path_pos_emb(self, octree, parent_depth: int) -> torch.Tensor:
+    child_indices = self._child_indices(octree, parent_depth)
+    child_pos = self._node_path_pos_emb(octree, parent_depth + 1)
+    safe = child_indices.clamp(min=0)
+    out = child_pos[safe]
+    return torch.where((child_indices >= 0).unsqueeze(-1), out, torch.zeros_like(out))
+
   def _z_condition_for_depth(self, octree, z: torch.Tensor, depth: int) -> torch.Tensor:
     batch_ids = octree.batch_id(depth).long()
     return self.z_cond_proj(z)[batch_ids]
@@ -404,9 +457,14 @@ class Fractal3DGenerator(nn.Module):
     z_cond = self.z_cond_proj(z)
     child_id = torch.arange(8, dtype=torch.long, device=octree.device)
     queries = self.local_pos_emb(child_id)
+    child_path_pos = self._node_path_pos_emb(octree, 1).view(batch_size, 8, self.dim)
 
     if parallel:
-      child_queries = queries.unsqueeze(0).expand(batch_size, -1, -1) + z_cond.unsqueeze(1)
+      child_queries = (
+        queries.unsqueeze(0).expand(batch_size, -1, -1)
+        + child_path_pos
+        + z_cond.unsqueeze(1)
+      )
       seq = torch.cat([root.unsqueeze(1), child_queries], dim=1)
       padding = torch.zeros(batch_size, 9, dtype=torch.bool, device=octree.device)
       attn_mask = torch.zeros(9, 9, dtype=torch.bool, device=octree.device)
@@ -420,7 +478,11 @@ class Fractal3DGenerator(nn.Module):
 
     child_outputs: list[torch.Tensor] = []
     for idx in range(8):
-      query = queries[idx].expand(batch_size, 1, -1) + z_cond.unsqueeze(1)
+      query = (
+        queries[idx].expand(batch_size, 1, -1)
+        + child_path_pos[:, idx:idx + 1]
+        + z_cond.unsqueeze(1)
+      )
       if idx == 0:
         seq = torch.cat([root.unsqueeze(1), query], dim=1)
       else:
@@ -471,9 +533,18 @@ class Fractal3DGenerator(nn.Module):
 
     valid_uncle = uncle_idx >= 0
     safe_uncle = uncle_idx.clamp(min=0)
+    path_pos = self._node_path_pos_emb(octree, parent_depth)
     context = torch.zeros(n_parent, 8, self.dim, device=octree.device)
-    context[:, 0] = parent_hidden[parent_idx] + self.role_emb.weight[ROLE_PARENT]
-    context[:, 1:8] = parent_hidden[safe_uncle] + self.role_emb.weight[ROLE_UNCLE]
+    context[:, 0] = (
+      parent_hidden[parent_idx]
+      + path_pos[parent_idx]
+      + self.role_emb.weight[ROLE_PARENT]
+    )
+    context[:, 1:8] = (
+      parent_hidden[safe_uncle]
+      + path_pos[safe_uncle]
+      + self.role_emb.weight[ROLE_UNCLE]
+    )
     context[:, 1:8] = torch.where(valid_uncle.unsqueeze(-1), context[:, 1:8], 0)
 
     padding_mask = torch.zeros(n_parent, 8, dtype=torch.bool, device=octree.device)
@@ -496,12 +567,13 @@ class Fractal3DGenerator(nn.Module):
     child_outputs: list[torch.Tensor] = []
     child_id = torch.arange(8, dtype=torch.long, device=octree.device)
     queries = self.local_pos_emb(child_id)
+    child_path_pos = self._child_path_pos_emb(octree, parent_depth)
     z_cond = None
     if z is not None:
       z_cond = self._z_condition_for_depth(octree, z, parent_depth).unsqueeze(1)
 
     for idx in range(8):
-      query = queries[idx].expand(n_parent, 1, -1)
+      query = queries[idx].expand(n_parent, 1, -1) + child_path_pos[:, idx:idx + 1]
       if z_cond is not None:
         query = query + z_cond
       if idx == 0:
@@ -533,6 +605,7 @@ class Fractal3DGenerator(nn.Module):
     n_parent = context.shape[0]
     child_id = torch.arange(8, dtype=torch.long, device=octree.device)
     queries = self.local_pos_emb(child_id).unsqueeze(0).expand(n_parent, -1, -1)
+    queries = queries + self._child_path_pos_emb(octree, parent_depth)
     if z is not None:
       queries = queries + self._z_condition_for_depth(octree, z, parent_depth).unsqueeze(1)
     seq = torch.cat([context, queries], dim=1)
