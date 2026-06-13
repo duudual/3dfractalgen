@@ -16,7 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
 DEFAULT_VAE_CKPT = PROJECT_ROOT / "outputs" / "vae_train" / "best.pt"
 DEFAULT_VQVAE_CKPT = PROJECT_ROOT / "ckpt" / "vqvae_large_im5_uncond_bsq32.pth"
 
-from fractal3d import Fractal3DVAE  # noqa: E402
+from fractal3d import Fractal3DVAE, OctreeConfig, ShapeOctreeDataset, collate_shapes  # noqa: E402
 from fractal3d.octgpt_vqvae import load_octgpt_vqvae  # noqa: E402
 from ocnn.octree import Octree, init_octree as ocnn_init_octree  # noqa: E402
 from ognn.octreed import OctreeD  # noqa: E402
@@ -35,6 +35,23 @@ def parse_args() -> argparse.Namespace:
     type=float,
     default=1.0,
     help="Scale standard-normal latent samples before decoding.")
+  parser.add_argument(
+    "--posterior-data",
+    default=None,
+    help="Dataset root used to build a posterior latent bank for sampling.")
+  parser.add_argument(
+    "--posterior-filelist",
+    default=None,
+    help="Filelist used to build the posterior latent bank.")
+  parser.add_argument(
+    "--posterior-vq-cache-dir",
+    default=None,
+    help="Cached VQ tokens used to encode posterior bank samples.")
+  parser.add_argument(
+    "--posterior-noise",
+    type=float,
+    default=0.0,
+    help="Sample z = mu + posterior_noise * std * eps from the posterior bank.")
   parser.add_argument(
     "--sample-tokens",
     action=argparse.BooleanOptionalAction,
@@ -85,6 +102,72 @@ def load_vae(path: str | Path, device: torch.device) -> tuple[Fractal3DVAE, dict
     print(f"unexpected checkpoint keys: {unexpected}")
   model.eval()
   return model, checkpoint
+
+
+def load_cached_tokens(cache_dir: Path, uid: str) -> torch.Tensor:
+  cached = torch.load(cache_dir / f"{uid}.pt", map_location="cpu", weights_only=False)
+  return cached["indices"].long()
+
+
+def split_by_depth(octree, full_depth: int, depth_stop: int) -> dict[int, torch.Tensor]:
+  return {
+    depth: octree.children[depth].ge(0).long()
+    for depth in range(full_depth, depth_stop)
+  }
+
+
+def build_posterior_bank(
+  model: Fractal3DVAE,
+  data: str,
+  filelist: str | None,
+  cache_dir: str,
+  full_depth: int,
+  depth_stop: int,
+  decode_depth: int,
+  saved_args: dict,
+  device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  config = OctreeConfig(
+    depth=decode_depth,
+    full_depth=full_depth,
+    points_scale=float(saved_args.get("points_scale", 1.0)),
+    max_points=int(saved_args.get("max_points", 120000)),
+    sample_seed=int(saved_args.get("sample_seed", 0)),
+  )
+  dataset = ShapeOctreeDataset(data, config=config, filelist=filelist)
+  mus: list[torch.Tensor] = []
+  stds: list[torch.Tensor] = []
+  cache_path = Path(cache_dir)
+  with torch.no_grad():
+    for sample in dataset:
+      batch = collate_shapes([sample])
+      uid = batch["uid"]
+      if isinstance(uid, (list, tuple)):
+        uid = uid[0]
+      octree = batch["octree_gt"].to(device)
+      vq_indices = load_cached_tokens(cache_path, str(uid)).to(device)
+      mu, logvar = model.encode(
+        octree, split_by_depth(octree, full_depth, depth_stop), vq_indices, depth_stop)
+      mus.append(mu.detach().cpu())
+      stds.append(torch.exp(0.5 * logvar).detach().cpu())
+  return torch.cat(mus, dim=0), torch.cat(stds, dim=0)
+
+
+def sample_latent(
+  z_dim: int,
+  device: torch.device,
+  z_scale: float,
+  posterior_bank: tuple[torch.Tensor, torch.Tensor] | None,
+  posterior_noise: float,
+) -> torch.Tensor:
+  if posterior_bank is None:
+    return torch.randn(1, z_dim, device=device) * z_scale
+  mus, stds = posterior_bank
+  idx = torch.randint(mus.shape[0], (1,)).item()
+  z = mus[idx:idx + 1].to(device)
+  if posterior_noise > 0:
+    z = z + posterior_noise * stds[idx:idx + 1].to(device) * torch.randn_like(z)
+  return z
 
 
 def sample_binary_logits(logits: torch.Tensor, temperature: float, sample_tokens: bool) -> torch.Tensor:
@@ -228,9 +311,29 @@ def main() -> None:
   decode_depth = int(saved.get("depth", depth_stop))
   z_dim = int(saved.get("z_dim", 128))
   vqvae = load_octgpt_vqvae(args.vqvae_ckpt, device)
+  posterior_bank = None
+  if args.posterior_data is not None:
+    if args.posterior_vq_cache_dir is None:
+      raise ValueError("--posterior-vq-cache-dir is required with --posterior-data")
+    posterior_bank = build_posterior_bank(
+      model,
+      args.posterior_data,
+      args.posterior_filelist,
+      args.posterior_vq_cache_dir,
+      full_depth,
+      depth_stop,
+      decode_depth,
+      saved,
+      device,
+    )
+    print(
+      f"posterior_bank_size={posterior_bank[0].shape[0]} "
+      f"mu_abs={posterior_bank[0].abs().mean().item():.6f} "
+      f"std_mean={posterior_bank[1].mean().item():.6f}")
 
   for index in range(args.num_samples):
-    z = torch.randn(1, z_dim, device=device) * args.z_scale
+    z = sample_latent(
+      z_dim, device, args.z_scale, posterior_bank, args.posterior_noise)
     with torch.no_grad():
       octree, vq_indices, split_by_depth = sample_structure_and_vq(
         model,
@@ -270,6 +373,8 @@ def main() -> None:
       "surface_sdf": surface_sdf,
       "checkpoint_epoch": checkpoint.get("epoch"),
       "checkpoint_best_val_loss": checkpoint.get("best_val_loss", math.nan),
+      "posterior_sampling": posterior_bank is not None,
+      "posterior_noise": args.posterior_noise,
     }, output_dir / f"{stem}_sample.pt")
     if args.decode_sdf:
       write_ply(output_dir / f"{stem}_surface.ply", surface)
