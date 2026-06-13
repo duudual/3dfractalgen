@@ -156,6 +156,94 @@ outputs/vae_train/last.pt
 outputs/vae_train/best.pt
 ```
 
+## Small-Data Overfit Debug
+
+```bash
+python scripts/make_debug_filelist.py \
+  --data data/02691156 \
+  --output outputs/debug_filelist.txt \
+  --count 4
+```
+
+Cache VQ tokens for only those examples:
+
+```bash
+python scripts/cache_vq_tokens.py \
+  --data data/02691156 \
+  --filelist outputs/debug_filelist.txt \
+  --output-dir outputs/vq_cache_debug \
+  --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
+  --depth 8 \
+  --full-depth 3 \
+  --depth-stop 6 \
+  --overwrite
+```
+
+Run beta-free reconstruction training:
+
+```bash
+python scripts/train_vae.py \
+  --data data/02691156 \
+  --filelist outputs/debug_filelist.txt \
+  --val-fraction 0 \
+  --vq-cache-dir outputs/vq_cache_debug \
+  --output-dir outputs/vae_overfit_debug \
+  --depth 8 \
+  --full-depth 3 \
+  --depth-stop 6 \
+  --beta-max 0 \
+  --batch-size 1 \
+  --epochs 200
+```
+
+Expected signs of a healthy implementation on 1-4 shapes:
+
+- `split_loss` should keep dropping and `split_accuracy` should approach 1.
+- `vq_loss` should drop below the random baseline near `0.69`.
+- `vq_bit_accuracy` should clearly exceed `0.55`.
+- `vq_node_exact` should become nonzero and increase.
+- With `--beta-max 0`, `kl_loss` can be large; that is acceptable during
+  reconstruction-only debugging.
+
+If this tiny run cannot overfit, inspect implementation alignment before trying
+larger training.
+
+## Diagnostic Logs
+
+`train_vae.py` logs the following metrics per epoch and to TensorBoard:
+
+- losses: `loss`, `split_loss`, `vq_loss`, `kl_loss`, `kl_per_dim`
+- split: `split_accuracy`, `split_target_rate`, `split_pred_rate`,
+  `split_precision`, `split_recall`
+- VQ bits: `vq_bit_accuracy`, `vq_node_exact`, `vq_target_one_rate`,
+  `vq_pred_one_rate`, `vq_one_precision`, `vq_one_recall`
+- latent: `z_mu_abs_mean`, `z_std_mean`, `beta`
+
+Useful interpretations:
+
+- `split_pred_rate` close to 0 or 1 while `split_recall`/`precision` is poor
+  means the split head is mostly predicting a majority class.
+- `vq_loss` around `0.69` and `vq_bit_accuracy` around `0.5` means VQ bits are
+  still near random guessing.
+- `kl_per_dim` quickly approaching 0 with `z_std_mean` near 1 can indicate
+  posterior collapse.
+- For the overfit run with `--beta-max 0`, prioritize reconstruction metrics
+  over KL.
+
+## Possible Improvements To Try
+
+- Reconstruction pretraining: train with `--beta-max 0`, then resume with a
+  small KL such as `--beta-max 1e-5`.
+- KL schedule: increase `--beta-warmup-epochs` or keep `beta` at 0 until
+  split/VQ overfit works.
+- VQ weighting: increase `--lambda-vq` if split learns but VQ stays near random.
+- Smaller debug model: reduce `--dim`, `--encoder-layers`, or `--decoder-layers`
+  for faster alignment tests.
+- Easier target depth: temporarily reduce `--depth-stop` to make VQ prediction
+  easier, then increase it after the pipeline overfits.
+- Check target alignment: verify cached `indices.shape[0]` equals
+  `octree.nnum[depth_stop]` for the same sample and preprocessing settings.
+
 ## Sample From VAE
 
 Generate samples from random latent vectors:

@@ -162,6 +162,10 @@ def split_losses(model, octree, z: torch.Tensor, args: argparse.Namespace) -> tu
   total_tokens = 0
   total_correct = 0
   split_tokens = 0
+  pred_split_tokens = 0
+  tp = 0
+  fp = 0
+  fn = 0
   for parent_depth in range(args.full_depth - 1, args.depth_stop - 1):
     targets, valid = child_split_targets(model, octree, parent_depth)
     if int(valid.sum().item()) == 0:
@@ -175,19 +179,43 @@ def split_losses(model, octree, z: torch.Tensor, args: argparse.Namespace) -> tu
     total_tokens += tokens
     pred = logits.argmax(dim=-1)
     total_correct += int(((pred == targets) & valid).sum().item())
-    split_tokens += int((targets[valid] == 1).sum().item())
+    valid_targets = targets[valid]
+    valid_pred = pred[valid]
+    target_split = valid_targets == 1
+    pred_split = valid_pred == 1
+    split_tokens += int(target_split.sum().item())
+    pred_split_tokens += int(pred_split.sum().item())
+    tp += int((pred_split & target_split).sum().item())
+    fp += int((pred_split & ~target_split).sum().item())
+    fn += int((~pred_split & target_split).sum().item())
     if parent_depth + 1 <= args.depth_stop - 1:
       parent_hidden = model.scatter_child_hidden(
         child_hidden, child_indices, int(octree.nnum[parent_depth + 1]))
 
   if total_tokens == 0:
     zero = z.sum() * 0.0
-    return zero, {"split_tokens": 0.0, "split_accuracy": 0.0, "split_positive": 0.0}, parent_hidden
+    return zero, {
+      "split_tokens": 0.0,
+      "split_accuracy": 0.0,
+      "split_positive": 0.0,
+      "split_pred_positive": 0.0,
+      "split_target_rate": 0.0,
+      "split_pred_rate": 0.0,
+      "split_precision": 0.0,
+      "split_recall": 0.0,
+    }, parent_hidden
   loss = torch.stack(losses).sum() / total_tokens
+  precision = tp / max(tp + fp, 1)
+  recall = tp / max(tp + fn, 1)
   return loss, {
     "split_tokens": float(total_tokens),
     "split_accuracy": total_correct / max(total_tokens, 1),
     "split_positive": float(split_tokens),
+    "split_pred_positive": float(pred_split_tokens),
+    "split_target_rate": split_tokens / max(total_tokens, 1),
+    "split_pred_rate": pred_split_tokens / max(total_tokens, 1),
+    "split_precision": precision,
+    "split_recall": recall,
   }, parent_hidden
 
 
@@ -202,18 +230,36 @@ def vq_loss(model, octree, parent_hidden: torch.Tensor, vq_indices: torch.Tensor
     octree, parent_depth, parent_hidden, parallel=args.parallel_child_train)
   valid_bits = valid.unsqueeze(-1).expand_as(targets)
   if int(valid_bits.sum().item()) == 0:
-    zero = z.sum() * 0.0
-    return zero, {"vq_bits": 0.0, "vq_bit_accuracy": 0.0, "vq_node_exact": 0.0}
+    zero = parent_hidden.sum() * 0.0
+    return zero, {
+      "vq_bits": 0.0,
+      "vq_bit_accuracy": 0.0,
+      "vq_node_exact": 0.0,
+      "vq_target_one_rate": 0.0,
+      "vq_pred_one_rate": 0.0,
+      "vq_one_precision": 0.0,
+      "vq_one_recall": 0.0,
+    }
   loss = F.cross_entropy(
     logits[valid_bits].reshape(-1, 2),
     targets[valid_bits].reshape(-1).long())
   pred = logits.argmax(dim=-1)
   correct = int(((pred == targets) & valid_bits).sum().item())
   exact = ((pred == targets) | ~valid_bits).all(dim=-1) & valid
+  target_ones = targets[valid_bits] == 1
+  pred_ones = pred[valid_bits] == 1
+  one_tp = int((pred_ones & target_ones).sum().item())
+  one_fp = int((pred_ones & ~target_ones).sum().item())
+  one_fn = int((~pred_ones & target_ones).sum().item())
+  total_bits = int(valid_bits.sum().item())
   return loss, {
-    "vq_bits": float(int(valid_bits.sum().item())),
-    "vq_bit_accuracy": correct / max(int(valid_bits.sum().item()), 1),
+    "vq_bits": float(total_bits),
+    "vq_bit_accuracy": correct / max(total_bits, 1),
     "vq_node_exact": float(exact.sum().item()) / max(int(valid.sum().item()), 1),
+    "vq_target_one_rate": float(target_ones.float().mean().item()),
+    "vq_pred_one_rate": float(pred_ones.float().mean().item()),
+    "vq_one_precision": one_tp / max(one_tp + one_fp, 1),
+    "vq_one_recall": one_tp / max(one_tp + one_fn, 1),
   }
 
 
@@ -259,7 +305,10 @@ def run_epoch(
 
   totals = {key: 0.0 for key in [
     "loss", "split_loss", "vq_loss", "kl_loss", "split_accuracy",
-    "vq_bit_accuracy", "vq_node_exact", "count",
+    "split_target_rate", "split_pred_rate", "split_precision", "split_recall",
+    "vq_bit_accuracy", "vq_node_exact", "vq_target_one_rate",
+    "vq_pred_one_rate", "vq_one_precision", "vq_one_recall",
+    "z_mu_abs_mean", "z_std_mean", "kl_per_dim", "count",
   ]}
   pbar = tqdm(loader, desc=("train" if training else "val") + f" {epoch:04d}", dynamic_ncols=True, leave=False)
   for batch in pbar:
@@ -271,6 +320,7 @@ def run_epoch(
       q_loss, q_stats = vq_loss(model.decoder, octree, parent_hidden, vq_indices, args)
       k_loss = model.kl_loss(mu, logvar)
       loss = s_loss + args.lambda_vq * q_loss + beta * k_loss
+      z_std = torch.exp(0.5 * torch.clamp(logvar, -30.0, 20.0))
 
     if training:
       assert optimizer is not None and scaler is not None
@@ -284,6 +334,15 @@ def run_epoch(
       global_step += 1
       if writer is not None and global_step % args.log_every == 0:
         writer.add_scalar("train/loss_total_step", float(loss.item()), global_step)
+        writer.add_scalar("train/split_loss_step", float(s_loss.detach().item()), global_step)
+        writer.add_scalar("train/vq_loss_step", float(q_loss.detach().item()), global_step)
+        writer.add_scalar("train/kl_loss_step", float(k_loss.detach().item()), global_step)
+        writer.add_scalar("train/split_precision_step", s_stats["split_precision"], global_step)
+        writer.add_scalar("train/split_recall_step", s_stats["split_recall"], global_step)
+        writer.add_scalar("train/vq_one_precision_step", q_stats["vq_one_precision"], global_step)
+        writer.add_scalar("train/vq_one_recall_step", q_stats["vq_one_recall"], global_step)
+        writer.add_scalar("train/z_mu_abs_mean_step", float(mu.detach().abs().mean().item()), global_step)
+        writer.add_scalar("train/z_std_mean_step", float(z_std.detach().mean().item()), global_step)
         writer.add_scalar("train/beta_step", beta, global_step)
 
     totals["loss"] += float(loss.detach().item())
@@ -291,8 +350,19 @@ def run_epoch(
     totals["vq_loss"] += float(q_loss.detach().item())
     totals["kl_loss"] += float(k_loss.detach().item())
     totals["split_accuracy"] += float(s_stats["split_accuracy"])
+    totals["split_target_rate"] += float(s_stats["split_target_rate"])
+    totals["split_pred_rate"] += float(s_stats["split_pred_rate"])
+    totals["split_precision"] += float(s_stats["split_precision"])
+    totals["split_recall"] += float(s_stats["split_recall"])
     totals["vq_bit_accuracy"] += float(q_stats["vq_bit_accuracy"])
     totals["vq_node_exact"] += float(q_stats["vq_node_exact"])
+    totals["vq_target_one_rate"] += float(q_stats["vq_target_one_rate"])
+    totals["vq_pred_one_rate"] += float(q_stats["vq_pred_one_rate"])
+    totals["vq_one_precision"] += float(q_stats["vq_one_precision"])
+    totals["vq_one_recall"] += float(q_stats["vq_one_recall"])
+    totals["z_mu_abs_mean"] += float(mu.detach().abs().mean().item())
+    totals["z_std_mean"] += float(z_std.detach().mean().item())
+    totals["kl_per_dim"] += float(k_loss.detach().item()) / max(mu.shape[-1], 1)
     totals["count"] += 1.0
     pbar.set_postfix(loss=f"{totals['loss'] / max(totals['count'], 1):.4f}")
 
