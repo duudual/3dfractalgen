@@ -20,7 +20,7 @@ Then it generates the 8 root-child hidden states and recursively expands hidden
 states down the octree. There is no `seed_token` or `initial_hidden` path in the
 current VAE workflow.
 
-## Data Preparation
+## Pipeline
 
 The raw ShapeNet category directory is expected to contain samples like:
 
@@ -28,11 +28,16 @@ The raw ShapeNet category directory is expected to contain samples like:
 data/02691156/<uid>/models/model_normalized.obj
 ```
 
-Convert OBJ meshes to OctGPT-compatible point clouds:
+### 1. Prepare Point Clouds
+
+Convert OBJ meshes to OctGPT-compatible `pointcloud.npz` files:
 
 ```bash
 cd 3dfractalgen
-python scripts/prepare_shapenet_pointclouds.py --data data/02691156 --points 200000
+python scripts/prepare_shapenet_pointclouds.py \
+  --data data/02691156 \
+  --points 200000 \
+  --overwrite
 ```
 
 This writes `pointcloud.npz` into each shape directory:
@@ -40,30 +45,16 @@ This writes `pointcloud.npz` into each shape directory:
 - `points`: sampled surface points, shape `[N, 3]`, `float16`
 - `normals`: corresponding face normals, shape `[N, 3]`, `float16`
 
-Verify OCNN octree construction:
+Optional octree construction check:
 
 ```bash
 python scripts/inspect_octree.py --data data/02691156 --depth 8 --full-depth 3
 ```
 
-For a quick smoke test:
+### 2. Select Training Shapes And Save GT
 
-```bash
-python scripts/prepare_shapenet_pointclouds.py \
-  --data data/02691156 \
-  --points 4096 \
-  --limit 2 \
-  --output-root outputs/airplane_pointcloud_smoke \
-  --overwrite
-
-python scripts/inspect_octree.py \
-  --data outputs/airplane_pointcloud_smoke \
-  --depth 8 \
-  --full-depth 3
-```
-
-To avoid always using only the first sorted instances, generate a strided
-training subset filelist and copy the matching GT meshes:
+Select a strided subset from shapes that already have `pointcloud.npz`, write a
+filelist, and copy matching GT meshes for later comparison:
 
 ```bash
 python scripts/select_training_shapes.py \
@@ -71,37 +62,40 @@ python scripts/select_training_shapes.py \
   --output outputs/airplane_stride10.txt \
   --gt-output-dir outputs/airplane_stride10_gt \
   --stride 10 \
-  --count 20
+  --count 48
 ```
 
-This writes 20 shape uids selected from indices `0, 10, 20, ...` and copies
-their `models/model_normalized.obj` files to `outputs/airplane_stride10_gt/`.
-Pass the same filelist to cache and training commands with
-`--filelist outputs/airplane_stride10.txt`.
-
-## VQ Token Cache
-
-VAE training needs GT VQ/BSQ tokens from the frozen OctGPT VQ-VAE. Caching them
-is recommended.
-
-Expected checkpoint:
+For `--stride 10 --count 48`, the selected sorted indices are
+`0, 10, 20, ...` up to 48 instances. The output filelist is used by all later
+steps:
 
 ```text
-ckpt/vqvae_large_im5_uncond_bsq32.pth
+outputs/airplane_stride10.txt
 ```
 
-Cache tokens:
+The copied GT meshes are saved under:
+
+```text
+outputs/airplane_stride10_gt/
+```
+
+### 3. Cache VQ Tokens
+
+VAE training needs GT VQ/BSQ tokens from the frozen OctGPT VQ-VAE. Cache tokens
+for the same filelist:
 
 ```bash
 python scripts/cache_vq_tokens.py \
   --data data/02691156 \
-  --output-dir outputs/vq_cache \
+  --filelist outputs/airplane_stride10.txt \
+  --output-dir outputs/vq_cache_stride10 \
   --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
   --depth 8 \
   --full-depth 3 \
   --depth-stop 6 \
   --num-vq-embed 32 \
-  --vq-groups 32
+  --vq-groups 32 \
+  --overwrite
 ```
 
 Each cached file stores:
@@ -111,15 +105,16 @@ Each cached file stores:
 - `code_depth`: expected to equal `--depth-stop`
 - metadata for depth, full depth, data scale, and VQ dimensions
 
-## Train VAE
+### 4. Train VAE
 
-Run joint VAE training:
+Train with the same filelist and cache directory:
 
 ```bash
 python scripts/train_vae.py \
   --data data/02691156 \
-  --vq-cache-dir outputs/vq_cache \
-  --output-dir outputs/vae_train \
+  --filelist outputs/airplane_stride10.txt \
+  --vq-cache-dir outputs/vq_cache_stride10 \
+  --output-dir outputs/vae_train_stride10 \
   --depth 8 \
   --full-depth 3 \
   --depth-stop 6 \
@@ -139,23 +134,6 @@ python scripts/train_vae.py \
   --epochs 100
 ```
 
-Without a cache, `train_vae.py` can encode VQ tokens online with the frozen
-VQ-VAE:
-
-```bash
-python scripts/train_vae.py \
-  --data data/02691156 \
-  --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
-  --output-dir outputs/vae_train_online \
-  --depth 8 \
-  --full-depth 3 \
-  --depth-stop 6
-```
-
-To train on a strided subset, first create a filelist with
-`scripts/select_training_shapes.py --stride K --count N`, then pass that file to
-both `cache_vq_tokens.py` and `train_vae.py` with `--filelist`.
-
 The training loss is:
 
 ```text
@@ -167,106 +145,66 @@ total = split_loss + lambda_vq * vq_loss + beta * KL(q(z|x) || N(0,I))
 TensorBoard logs are written to:
 
 ```text
-outputs/vae_train/tensorboard
+outputs/vae_train_stride10/tensorboard
 ```
 
 Checkpoints:
 
 ```text
-outputs/vae_train/last.pt
-outputs/vae_train/best.pt
+outputs/vae_train_stride10/last.pt
+outputs/vae_train_stride10/best.pt
 ```
 
-## Small-Data Overfit
+### 5. Sample Generated Shapes
+
+Random latent sampling:
 
 ```bash
-python scripts/select_training_shapes.py \
-  --data data/02691156 \
-  --output outputs/overfit_filelist.txt \
-  --gt-output-dir outputs/overfit_gt \
-  --count 4
-```
-
-Cache VQ tokens for only those examples:
-
-```bash
-python scripts/cache_vq_tokens.py \
-  --data data/02691156 \
-  --filelist outputs/overfit_filelist.txt \
-  --output-dir outputs/vq_cache_debug \
+python scripts/sample_vae.py \
+  --vae-ckpt outputs/vae_train_stride10/best.pt \
   --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
-  --depth 8 \
-  --full-depth 3 \
-  --depth-stop 6 \
-  --overwrite
+  --output-dir outputs/vae_samples_stride10 \
+  --num-samples 48 \
+  --temperature-split 1.0 \
+  --temperature-vq 1.0 \
+  --sample-tokens
 ```
 
-Run beta-free reconstruction training:
+Posterior-bank sampling uses latent statistics from the same training subset:
 
 ```bash
-python scripts/train_vae.py \
-  --data data/02691156 \
-  --filelist outputs/overfit_filelist.txt \
-  --val-fraction 0 \
-  --vq-cache-dir outputs/vq_cache_debug \
-  --output-dir outputs/vae_overfit_debug \
-  --depth 8 \
-  --full-depth 3 \
-  --depth-stop 6 \
-  --beta-max 0 \
-  --batch-size 1 \
-  --epochs 200
-```
-
-Expected signs of a healthy implementation on 1-4 shapes:
-
-- `split_loss` should keep dropping and `split_accuracy` should approach 1.
-- `vq_loss` should drop below the random baseline near `0.69`.
-- `vq_bit_accuracy` should clearly exceed `0.55`.
-- `vq_node_exact` should become nonzero and increase.
-- With `--beta-max 0`, `kl_loss` can be large; that is acceptable during
-  reconstruction-only debugging.
-
-If this tiny run cannot overfit, inspect implementation alignment before trying
-larger training.
-
-For an even smaller split-first debug target, stop at `depth_stop=4`. The frozen
-OctGPT VQ-VAE used here has `code_depth = input_depth - 2`, so the matching
-cache command must use `--depth 6`, not `--depth 8`:
-
-```bash
-python scripts/cache_vq_tokens.py \
-  --data data/02691156 \
-  --filelist outputs/overfit_filelist.txt \
-  --output-dir outputs/vq_cache_debug_d4 \
+python scripts/sample_vae.py \
+  --vae-ckpt outputs/vae_train_stride10/best.pt \
   --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
-  --depth 6 \
-  --full-depth 3 \
-  --depth-stop 4 \
-  --overwrite
+  --posterior-data data/02691156 \
+  --posterior-filelist outputs/airplane_stride10.txt \
+  --posterior-vq-cache-dir outputs/vq_cache_stride10 \
+  --output-dir outputs/vae_samples_stride10_posterior \
+  --num-samples 48
 ```
 
-Then run a deterministic, beta-free split-focused overfit:
+Sampling writes:
 
-```bash
-python scripts/train_vae.py \
-  --data data/02691156 \
-  --filelist outputs/overfit_filelist.txt \
-  --val-fraction 0 \
-  --vq-cache-dir outputs/vq_cache_debug_d4 \
-  --output-dir outputs/vae_overfit_split_d4 \
-  --depth 6 \
-  --full-depth 3 \
-  --depth-stop 4 \
-  --beta-max 0 \
-  --lambda-vq 0 \
-  --split-pos-weight 2.0 \
-  --deterministic-z \
-  --batch-size 1 \
-  --epochs 100
+- `*_sample.pt`: latent `z`, predicted split tokens, predicted VQ indices,
+  near-surface points, and SDF values
+- `*_surface.ply`: near-surface point cloud sampled from the decoded SDF field
+- `*.obj`: generated marching-cubes mesh when `--export-mesh` is enabled
+
+Compare generated meshes against the GT meshes saved in:
+
+```text
+outputs/airplane_stride10_gt/
 ```
 
-## Diagnostic Logs
+The main comparison artifacts are:
+
+```text
+outputs/vae_samples_stride10_posterior/*.obj
+outputs/vae_samples_stride10_posterior/*_surface.ply
+outputs/airplane_stride10_gt/*.obj
+```
+
+## Diagnostics
 
 `train_vae.py` logs the following metrics per epoch and to TensorBoard:
 
@@ -285,74 +223,8 @@ Useful interpretations:
   still near random guessing.
 - `kl_per_dim` quickly approaching 0 with `z_std_mean` near 1 can indicate
   posterior collapse.
-- For the overfit run with `--beta-max 0`, prioritize reconstruction metrics
-  over KL.
-
-## Possible Improvements To Try
-
-- Reconstruction pretraining: train with `--beta-max 0`, then resume with a
-  small KL such as `--beta-max 1e-5`.
-- KL schedule: increase `--beta-warmup-epochs` or keep `beta` at 0 until
-  split/VQ overfit works.
-- VQ weighting: increase `--lambda-vq` if split learns but VQ stays near random.
-- Smaller debug model: reduce `--dim`, `--encoder-layers`, or `--decoder-layers`
-  for faster alignment tests.
-- Easier target depth: temporarily reduce `--depth-stop` to make VQ prediction
-  easier, then increase it after the pipeline overfits.
 - Check target alignment: verify cached `indices.shape[0]` equals
   `octree.nnum[depth_stop]` for the same sample and preprocessing settings.
-
-## Sample From VAE
-
-Generate samples from random latent vectors:
-
-```bash
-python scripts/sample_vae.py \
-  --vae-ckpt outputs/vae_train/best.pt \
-  --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
-  --output-dir outputs/vae_samples \
-  --num-samples 8 \
-  --temperature-split 1.0 \
-  --temperature-vq 1.0 \
-  --sample-tokens
-```
-
-For deterministic argmax sampling:
-
-```bash
-python scripts/sample_vae.py \
-  --vae-ckpt outputs/vae_train/best.pt \
-  --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
-  --output-dir outputs/vae_samples_argmax \
-  --num-samples 8 \
-  --no-sample-tokens
-```
-
-Sampling writes:
-
-- `*_sample.pt`: latent `z`, predicted split tokens, predicted VQ indices,
-  near-surface points, and SDF values
-- `*_surface.ply`: near-surface point cloud sampled from the decoded SDF field
-- `*.obj`: generated marching-cubes mesh when `--export-mesh` is enabled
-
-When sampling from the posterior bank, reuse the same filelist used for training:
-
-```bash
-python scripts/sample_vae.py \
-  --vae-ckpt outputs/vae_train/best.pt \
-  --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
-  --posterior-data data/02691156 \
-  --posterior-filelist outputs/airplane_stride10.txt \
-  --posterior-vq-cache-dir outputs/vq_cache \
-  --output-dir outputs/vae_samples_posterior \
-  --num-samples 8
-```
-
-The matching GT meshes should already be available in the `--gt-output-dir`
-created by `scripts/select_training_shapes.py`.
-
-The PLY point cloud is intended as a fast qualitative check for the generated
-implicit field; the OBJ mesh is the easier artifact for side-by-side comparison.
 
 ## Current Model Flow
 

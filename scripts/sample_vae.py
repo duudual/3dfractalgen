@@ -54,6 +54,10 @@ def parse_args() -> argparse.Namespace:
     default=0.0,
     help="Sample z = mu + posterior_noise * std * eps from the posterior bank.")
   parser.add_argument(
+    "--posterior-sequential",
+    action="store_true",
+    help="Use posterior bank entries in filelist order instead of random sampling.")
+  parser.add_argument(
     "--sample-tokens",
     action=argparse.BooleanOptionalAction,
     default=True)
@@ -140,7 +144,7 @@ def build_posterior_bank(
   decode_depth: int,
   saved_args: dict,
   device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
   config = OctreeConfig(
     depth=decode_depth,
     full_depth=full_depth,
@@ -151,6 +155,7 @@ def build_posterior_bank(
   dataset = ShapeOctreeDataset(data, config=config, filelist=filelist)
   mus: list[torch.Tensor] = []
   stds: list[torch.Tensor] = []
+  uids: list[str] = []
   cache_path = Path(cache_dir)
   with torch.no_grad():
     for sample in dataset:
@@ -164,24 +169,44 @@ def build_posterior_bank(
         octree, split_by_depth(octree, full_depth, depth_stop), vq_indices, depth_stop)
       mus.append(mu.detach().cpu())
       stds.append(torch.exp(0.5 * logvar).detach().cpu())
-  return torch.cat(mus, dim=0), torch.cat(stds, dim=0)
+      uids.append(str(uid))
+  return torch.cat(mus, dim=0), torch.cat(stds, dim=0), uids
 
 
 def sample_latent(
   z_dim: int,
   device: torch.device,
   z_scale: float,
-  posterior_bank: tuple[torch.Tensor, torch.Tensor] | None,
+  posterior_bank: tuple[torch.Tensor, torch.Tensor, list[str]] | None,
   posterior_noise: float,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, int | None, str | None, torch.Tensor | None, torch.Tensor | None]:
   if posterior_bank is None:
-    return torch.randn(1, z_dim, device=device) * z_scale
-  mus, stds = posterior_bank
+    z = torch.randn(1, z_dim, device=device) * z_scale
+    return z, None, None, None, None
+  mus, stds, uids = posterior_bank
   idx = torch.randint(mus.shape[0], (1,)).item()
-  z = mus[idx:idx + 1].to(device)
+  mu = mus[idx:idx + 1]
+  std = stds[idx:idx + 1]
+  z = mu.to(device)
   if posterior_noise > 0:
-    z = z + posterior_noise * stds[idx:idx + 1].to(device) * torch.randn_like(z)
-  return z
+    z = z + posterior_noise * std.to(device) * torch.randn_like(z)
+  return z, idx, uids[idx], mu, std
+
+
+def posterior_latent_at(
+  posterior_bank: tuple[torch.Tensor, torch.Tensor, list[str]],
+  index: int,
+  device: torch.device,
+  posterior_noise: float,
+) -> tuple[torch.Tensor, int, str, torch.Tensor, torch.Tensor]:
+  mus, stds, uids = posterior_bank
+  idx = index % mus.shape[0]
+  mu = mus[idx:idx + 1]
+  std = stds[idx:idx + 1]
+  z = mu.to(device)
+  if posterior_noise > 0:
+    z = z + posterior_noise * std.to(device) * torch.randn_like(z)
+  return z, idx, uids[idx], mu, std
 
 
 def sample_binary_logits(logits: torch.Tensor, temperature: float, sample_tokens: bool) -> torch.Tensor:
@@ -430,8 +455,16 @@ def main() -> None:
       f"std_mean={posterior_bank[1].mean().item():.6f}")
 
   for index in range(args.num_samples):
-    z = sample_latent(
-      z_dim, device, args.z_scale, posterior_bank, args.posterior_noise)
+    posterior_index = None
+    posterior_uid = None
+    posterior_mu = None
+    posterior_std = None
+    if posterior_bank is not None and args.posterior_sequential:
+      z, posterior_index, posterior_uid, posterior_mu, posterior_std = posterior_latent_at(
+        posterior_bank, index, device, args.posterior_noise)
+    else:
+      z, posterior_index, posterior_uid, posterior_mu, posterior_std = sample_latent(
+        z_dim, device, args.z_scale, posterior_bank, args.posterior_noise)
     with torch.no_grad():
       octree, vq_indices, split_by_depth = sample_structure_and_vq(
         model,
@@ -479,6 +512,11 @@ def main() -> None:
       "checkpoint_best_val_loss": checkpoint.get("best_val_loss", math.nan),
       "posterior_sampling": posterior_bank is not None,
       "posterior_noise": args.posterior_noise,
+      "posterior_sequential": args.posterior_sequential,
+      "posterior_index": posterior_index,
+      "posterior_uid": posterior_uid,
+      "posterior_mu": None if posterior_mu is None else posterior_mu.detach().cpu(),
+      "posterior_std": None if posterior_std is None else posterior_std.detach().cpu(),
     }, output_dir / f"{stem}_sample.pt")
     if args.decode_sdf:
       write_ply(output_dir / f"{stem}_surface.ply", surface)
@@ -496,6 +534,7 @@ def main() -> None:
     print(
       f"sample={index} nodes_depth_stop={int(octree.nnum[depth_stop])} "
       f"splits={{{', '.join(f'{depth}: {int(split.sum())}' for depth, split in split_by_depth.items())}}} "
+      f"posterior_uid={posterior_uid} "
       f"saved={output_dir / f'{stem}_sample.pt'}")
 
 
