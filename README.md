@@ -62,6 +62,23 @@ python scripts/inspect_octree.py \
   --full-depth 3
 ```
 
+To avoid always using only the first sorted instances, generate a strided
+training subset filelist and copy the matching GT meshes:
+
+```bash
+python scripts/select_training_shapes.py \
+  --data data/02691156 \
+  --output outputs/airplane_stride10.txt \
+  --gt-output-dir outputs/airplane_stride10_gt \
+  --stride 10 \
+  --count 20
+```
+
+This writes 20 shape uids selected from indices `0, 10, 20, ...` and copies
+their `models/model_normalized.obj` files to `outputs/airplane_stride10_gt/`.
+Pass the same filelist to cache and training commands with
+`--filelist outputs/airplane_stride10.txt`.
+
 ## VQ Token Cache
 
 VAE training needs GT VQ/BSQ tokens from the frozen OctGPT VQ-VAE. Caching them
@@ -135,6 +152,10 @@ python scripts/train_vae.py \
   --depth-stop 6
 ```
 
+To train on a strided subset, first create a filelist with
+`scripts/select_training_shapes.py --stride K --count N`, then pass that file to
+both `cache_vq_tokens.py` and `train_vae.py` with `--filelist`.
+
 The training loss is:
 
 ```text
@@ -156,12 +177,13 @@ outputs/vae_train/last.pt
 outputs/vae_train/best.pt
 ```
 
-## Small-Data Overfit Debug
+## Small-Data Overfit
 
 ```bash
-python scripts/make_debug_filelist.py \
+python scripts/select_training_shapes.py \
   --data data/02691156 \
-  --output outputs/debug_filelist.txt \
+  --output outputs/overfit_filelist.txt \
+  --gt-output-dir outputs/overfit_gt \
   --count 4
 ```
 
@@ -170,7 +192,7 @@ Cache VQ tokens for only those examples:
 ```bash
 python scripts/cache_vq_tokens.py \
   --data data/02691156 \
-  --filelist outputs/debug_filelist.txt \
+  --filelist outputs/overfit_filelist.txt \
   --output-dir outputs/vq_cache_debug \
   --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
   --depth 8 \
@@ -184,7 +206,7 @@ Run beta-free reconstruction training:
 ```bash
 python scripts/train_vae.py \
   --data data/02691156 \
-  --filelist outputs/debug_filelist.txt \
+  --filelist outputs/overfit_filelist.txt \
   --val-fraction 0 \
   --vq-cache-dir outputs/vq_cache_debug \
   --output-dir outputs/vae_overfit_debug \
@@ -215,7 +237,7 @@ cache command must use `--depth 6`, not `--depth 8`:
 ```bash
 python scripts/cache_vq_tokens.py \
   --data data/02691156 \
-  --filelist outputs/debug_filelist.txt \
+  --filelist outputs/overfit_filelist.txt \
   --output-dir outputs/vq_cache_debug_d4 \
   --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
   --depth 6 \
@@ -229,7 +251,7 @@ Then run a deterministic, beta-free split-focused overfit:
 ```bash
 python scripts/train_vae.py \
   --data data/02691156 \
-  --filelist outputs/debug_filelist.txt \
+  --filelist outputs/overfit_filelist.txt \
   --val-fraction 0 \
   --vq-cache-dir outputs/vq_cache_debug_d4 \
   --output-dir outputs/vae_overfit_split_d4 \
@@ -311,10 +333,26 @@ Sampling writes:
 - `*_sample.pt`: latent `z`, predicted split tokens, predicted VQ indices,
   near-surface points, and SDF values
 - `*_surface.ply`: near-surface point cloud sampled from the decoded SDF field
+- `*.obj`: generated marching-cubes mesh when `--export-mesh` is enabled
 
-The current sampler exports near-surface point clouds rather than marching-cubes
-meshes. It is intended as a fast qualitative check for the generated implicit
-field.
+When sampling from the posterior bank, reuse the same filelist used for training:
+
+```bash
+python scripts/sample_vae.py \
+  --vae-ckpt outputs/vae_train/best.pt \
+  --vqvae-ckpt ckpt/vqvae_large_im5_uncond_bsq32.pth \
+  --posterior-data data/02691156 \
+  --posterior-filelist outputs/airplane_stride10.txt \
+  --posterior-vq-cache-dir outputs/vq_cache \
+  --output-dir outputs/vae_samples_posterior \
+  --num-samples 8
+```
+
+The matching GT meshes should already be available in the `--gt-output-dir`
+created by `scripts/select_training_shapes.py`.
+
+The PLY point cloud is intended as a fast qualitative check for the generated
+implicit field; the OBJ mesh is the easier artifact for side-by-side comparison.
 
 ## Current Model Flow
 
@@ -342,10 +380,12 @@ z ~ N(0, I)
         -> near-surface point cloud
 ```
 
-The old split-only and VQ-only scripts are obsolete because they depended on the
-removed seed-based initialization path. Use:
+The current executable pipeline uses:
 
 ```text
+scripts/prepare_shapenet_pointclouds.py
+scripts/select_training_shapes.py
+scripts/cache_vq_tokens.py
 scripts/train_vae.py
 scripts/sample_vae.py
 ```
